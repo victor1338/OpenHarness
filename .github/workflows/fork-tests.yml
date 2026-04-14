@@ -1,0 +1,32 @@
+name: Fork Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  thinking-pipeline:
+    name: Thinking pipeline tests
+    if: github.repository == 'victor1338/OpenHarness'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run fork-specific tests
+        run: uv run pytest tests/test_ui/test_thinking_pipeline.py -v
