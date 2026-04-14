@@ -14,12 +14,14 @@ from openharness.api.client import (
     ApiMessageRequest,
     ApiRetryEvent,
     ApiTextDeltaEvent,
+    ApiThinkingDeltaEvent,
     SupportsStreamingMessages,
 )
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, ToolResultBlock
 from openharness.engine.stream_events import (
     AssistantTextDelta,
+    ThinkingDelta,
     AssistantTurnComplete,
     CompactProgressEvent,
     ErrorEvent,
@@ -476,6 +478,9 @@ async def run_query(
                     tools=context.tool_registry.to_api_schema(),
                 )
             ):
+                if isinstance(event, ApiThinkingDeltaEvent):
+                    yield ThinkingDelta(text=event.text), None
+                    continue
                 if isinstance(event, ApiTextDeltaEvent):
                     yield AssistantTextDelta(text=event.text), None
                     continue

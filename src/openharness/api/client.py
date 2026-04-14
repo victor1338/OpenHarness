@@ -64,6 +64,13 @@ class ApiMessageCompleteEvent:
 
 
 @dataclass(frozen=True)
+class ApiThinkingDeltaEvent:
+    """Incremental reasoning/thinking text produced by the model."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class ApiRetryEvent:
     """A recoverable upstream failure that will be retried automatically."""
 
@@ -73,7 +80,7 @@ class ApiRetryEvent:
     delay_seconds: float
 
 
-ApiStreamEvent = ApiTextDeltaEvent | ApiMessageCompleteEvent | ApiRetryEvent
+ApiStreamEvent = ApiTextDeltaEvent | ApiThinkingDeltaEvent | ApiMessageCompleteEvent | ApiRetryEvent
 
 
 class SupportsStreamingMessages(Protocol):

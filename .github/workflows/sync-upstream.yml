@@ -1,0 +1,87 @@
+name: Sync from upstream HKUDS/OpenHarness
+
+on:
+  schedule:
+    # Check for upstream updates daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/HKUDS/OpenHarness.git || true
+          git fetch upstream main
+
+      - name: Check for new commits
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt merge
+        if: steps.check.outputs.up_to_date == 'false'
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git merge upstream/main --no-edit; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            git push origin main
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git merge --abort
+          fi
+
+      - name: Create issue on conflict
+        if: steps.merge.outputs.conflict == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Upstream merge conflict from HKUDS/OpenHarness',
+              body: `Automatic sync from [HKUDS/OpenHarness](https://github.com/HKUDS/OpenHarness) failed due to merge conflicts.\n\nPlease resolve manually:\n\`\`\`bash\ngit fetch upstream main\ngit merge upstream/main\n# resolve conflicts\ngit push origin main\n\`\`\``,
+              labels: ['upstream-sync', 'conflict']
+            });
+
+      - name: Send email on conflict
+        if: steps.merge.outputs.conflict == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "⚠️ OpenHarness upstream merge conflict"
+          to: victorlee1338@gmail.com
+          from: OpenHarness Sync Bot
+          body: |
+            Automatic sync from HKUDS/OpenHarness to victor1338/OpenHarness failed due to merge conflicts.
+
+            Please resolve manually:
+              git fetch upstream main
+              git merge upstream/main
+              # resolve conflicts
+              git push origin main
+
+            See: https://github.com/victor1338/OpenHarness/actions

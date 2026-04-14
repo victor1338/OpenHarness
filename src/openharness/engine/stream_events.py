@@ -10,6 +10,13 @@ from openharness.engine.messages import ConversationMessage
 
 
 @dataclass(frozen=True)
+class ThinkingDelta:
+    """Incremental reasoning/thinking text from the model."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class AssistantTextDelta:
     """Incremental assistant text."""
 
@@ -79,7 +86,8 @@ class CompactProgressEvent:
 
 
 StreamEvent = (
-    AssistantTextDelta
+    ThinkingDelta
+    | AssistantTextDelta
     | AssistantTurnComplete
     | ToolExecutionStarted
     | ToolExecutionCompleted

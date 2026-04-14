@@ -1,4 +1,4 @@
-"""OpenAI-compatible API client for providers like Alibaba DashScope, GitHub Models, etc."""
+﻿"""OpenAI-compatible API client for providers like Alibaba DashScope, GitHub Models, etc."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from openai import AsyncOpenAI
 
 from openharness.api.client import (
     ApiMessageCompleteEvent,
+    ApiThinkingDeltaEvent,
     ApiMessageRequest,
     ApiRetryEvent,
     ApiStreamEvent,
@@ -121,7 +122,32 @@ def _convert_messages_to_openai(
                 # Empty user message (shouldn't happen, but handle gracefully)
                 openai_messages.append({"role": "user", "content": ""})
 
-    return openai_messages
+    # Post-process: strip assistant messages with dangling tool_calls
+    # (no matching tool results follow) to avoid 400 errors.
+    sanitized: list[dict[str, Any]] = []
+    i = 0
+    while i < len(openai_messages):
+        msg = openai_messages[i]
+        if msg.get('role') == 'assistant':
+            tc = msg.get('tool_calls')
+            has_content = msg.get('content') is not None
+            if tc:
+                needed = {c['id'] for c in tc}
+                j = i + 1
+                found: set[str] = set()
+                while j < len(openai_messages) and openai_messages[j].get('role') == 'tool':
+                    found.add(openai_messages[j].get('tool_call_id', ''))
+                    j += 1
+                if not needed.issubset(found):
+                    i = j
+                    continue
+            elif not has_content:
+                i += 1
+                continue
+        sanitized.append(msg)
+        i += 1
+
+    return sanitized
 
 
 def _convert_user_content_to_openai(blocks: list[ContentBlock]) -> str | list[dict[str, Any]]:
@@ -320,6 +346,7 @@ class OpenAICompatibleClient:
             reasoning_piece = getattr(delta, "reasoning_content", None) or ""
             if reasoning_piece:
                 collected_reasoning += reasoning_piece
+                yield ApiThinkingDeltaEvent(text=reasoning_piece)
 
             # Stream text content to user
             if delta.content:

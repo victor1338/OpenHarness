@@ -19,6 +19,7 @@ from openharness.bridge import get_bridge_manager
 from openharness.themes import list_themes
 from openharness.engine.stream_events import (
     AssistantTextDelta,
+    ThinkingDelta,
     AssistantTurnComplete,
     CompactProgressEvent,
     ErrorEvent,
@@ -203,6 +204,9 @@ class ReactBackendHost:
             )
 
         async def _render_event(event: StreamEvent) -> None:
+            if isinstance(event, ThinkingDelta):
+                await self._emit(BackendEvent(type="thinking_delta", message=event.text))
+                return
             if isinstance(event, AssistantTextDelta):
                 await self._emit(BackendEvent(type="assistant_delta", message=event.text))
                 return

@@ -9,7 +9,7 @@ from openharness.api.client import SupportsStreamingMessages
 from openharness.engine.cost_tracker import CostTracker
 from openharness.coordinator.coordinator_mode import get_coordinator_user_context
 from openharness.engine.messages import ConversationMessage, TextBlock, ToolResultBlock
-from openharness.engine.query import AskUserPrompt, PermissionPrompt, QueryContext, remember_user_goal, run_query
+from openharness.engine.query import AskUserPrompt, MaxTurnsExceeded, PermissionPrompt, QueryContext, remember_user_goal, run_query
 from openharness.engine.stream_events import AssistantTurnComplete, StreamEvent
 from openharness.hooks import HookExecutor
 from openharness.permissions.checker import PermissionChecker
@@ -174,12 +174,19 @@ class QueryEngine:
         coordinator_context = self._build_coordinator_context_message()
         if coordinator_context is not None:
             query_messages.append(coordinator_context)
-        async for event, usage in run_query(context, query_messages):
-            if isinstance(event, AssistantTurnComplete):
-                self._messages = list(query_messages)
-            if usage is not None:
-                self._cost_tracker.add(usage)
-            yield event
+        try:
+            async for event, usage in run_query(context, query_messages):
+                if isinstance(event, AssistantTurnComplete):
+                    self._messages = list(query_messages)
+                if usage is not None:
+                    self._cost_tracker.add(usage)
+                yield event
+        except MaxTurnsExceeded:
+            # run_query mutates query_messages in-place before raising MaxTurnsExceeded.
+            # Sync self._messages so the final tool results are preserved,
+            # enabling has_pending_continuation() to return True for /continue.
+            self._messages = list(query_messages)
+            raise
 
     async def continue_pending(self, *, max_turns: int | None = None) -> AsyncIterator[StreamEvent]:
         """Continue an interrupted tool loop without appending a new user message."""

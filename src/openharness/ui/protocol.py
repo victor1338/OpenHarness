@@ -1,4 +1,4 @@
-"""Structured protocol models for the React TUI backend."""
+﻿"""Structured protocol models for the React TUI backend."""
 
 from __future__ import annotations
 
@@ -71,6 +71,7 @@ class BackendEvent(BaseModel):
         "tasks_snapshot",
         "transcript_item",
         "compact_progress",
+        "thinking_delta",
         "assistant_delta",
         "assistant_complete",
         "line_complete",
