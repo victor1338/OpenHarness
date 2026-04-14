@@ -9,6 +9,7 @@ on:
 jobs:
   python-tests:
     name: Python tests (${{ matrix.python-version }})
+    if: github.repository == 'HKUDS/OpenHarness'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -38,6 +39,7 @@ jobs:
 
   python-quality:
     name: Python quality
+    if: github.repository == 'HKUDS/OpenHarness'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -61,6 +63,7 @@ jobs:
 
   frontend-typecheck:
     name: Frontend typecheck
+    if: github.repository == 'HKUDS/OpenHarness'
     runs-on: ubuntu-latest
     defaults:
       run:
