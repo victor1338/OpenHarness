@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
   issues: write
+  pull-requests: write
 
 jobs:
   sync:
@@ -28,12 +29,15 @@ jobs:
       - name: Check for new commits
         id: check
         run: |
-          LOCAL=$(git rev-parse HEAD)
-          UPSTREAM=$(git rev-parse upstream/main)
-          if [ "$LOCAL" = "$UPSTREAM" ]; then
+          # Use merge-base --is-ancestor to correctly detect whether
+          # upstream/main is already fully contained in our branch,
+          # even when the fork has its own extra commits.
+          if git merge-base --is-ancestor upstream/main HEAD; then
             echo "up_to_date=true" >> "$GITHUB_OUTPUT"
           else
             echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream has new commits not yet in fork:"
+            git log --oneline HEAD..upstream/main
           fi
 
       - name: Attempt merge
@@ -47,24 +51,94 @@ jobs:
             git push origin main
           else
             echo "conflict=true" >> "$GITHUB_OUTPUT"
+            # Capture conflicting files before aborting
+            CONFLICTED=$(git diff --name-only --diff-filter=U | head -20)
+            echo "conflicted_files<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$CONFLICTED" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
             git merge --abort
           fi
 
-      - name: Create issue on conflict
+      - name: Create PR branch on conflict
+        if: steps.merge.outputs.conflict == 'true'
+        id: pr_branch
+        run: |
+          BRANCH="auto/sync-upstream-$(date +%Y%m%d-%H%M%S)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH"
+          # Merge with conflict markers left in so the PR diff shows them
+          git merge upstream/main --no-edit || true
+          # Stage everything (including conflicted files) so we can push
+          git add -A
+          git commit --no-edit -m "WIP: upstream sync with conflicts to resolve" || true
+          git push origin "$BRANCH"
+
+      - name: Create PR on conflict
         if: steps.merge.outputs.conflict == 'true'
         uses: actions/github-script@v7
         with:
           script: |
+            const conflicted = `${{ steps.merge.outputs.conflicted_files }}`;
+            const body = [
+              'Automatic sync from [HKUDS/OpenHarness](https://github.com/HKUDS/OpenHarness) failed due to merge conflicts.',
+              '',
+              '**Conflicting files:**',
+              '```',
+              conflicted || '(could not determine)',
+              '```',
+              '',
+              'This branch contains the merge with conflict markers. Please:',
+              '1. Check out this branch locally',
+              '2. Resolve the conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`)',
+              '3. Commit and push',
+              '4. Merge or squash-merge this PR into `main`',
+              '',
+              'Or resolve manually:',
+              '```bash',
+              'git fetch upstream main',
+              'git merge upstream/main',
+              '# resolve conflicts',
+              'git push origin main',
+              '```',
+            ].join('\n');
+
+            await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Upstream sync conflict — resolve and merge',
+              head: '${{ steps.pr_branch.outputs.branch }}',
+              base: 'main',
+              body,
+            });
+
+      - name: Create issue on conflict (if PR creation fails)
+        if: steps.merge.outputs.conflict == 'true' && failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Avoid duplicate issues — check for existing open one
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync',
+              per_page: 1,
+            });
+            if (issues.length > 0) {
+              console.log('Open upstream-sync issue already exists, skipping.');
+              return;
+            }
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: '⚠️ Upstream merge conflict from HKUDS/OpenHarness',
               body: `Automatic sync from [HKUDS/OpenHarness](https://github.com/HKUDS/OpenHarness) failed due to merge conflicts.\n\nPlease resolve manually:\n\`\`\`bash\ngit fetch upstream main\ngit merge upstream/main\n# resolve conflicts\ngit push origin main\n\`\`\``,
-              labels: ['upstream-sync', 'conflict']
+              labels: ['upstream-sync'],
             });
 
       - name: Send email on conflict
         if: steps.merge.outputs.conflict == 'true'
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
@@ -78,7 +152,13 @@ jobs:
           body: |
             Automatic sync from HKUDS/OpenHarness to victor1338/OpenHarness failed due to merge conflicts.
 
-            Please resolve manually:
+            Conflicting files:
+            ${{ steps.merge.outputs.conflicted_files }}
+
+            A PR branch has been created for resolution.
+            See: https://github.com/victor1338/OpenHarness/pulls
+
+            Or resolve manually:
               git fetch upstream main
               git merge upstream/main
               # resolve conflicts
