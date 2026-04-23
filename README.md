@@ -228,6 +228,10 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
+- **Unreleased** 🔍 **Dry-run safe preview**:
+  - `oh --dry-run` previews resolved runtime settings, auth state, skills, commands, tools, and configured MCP servers without executing the model, tools, or subagents.
+  - Dry-run now reports a `ready` / `warning` / `blocked` readiness verdict with concrete next-step suggestions such as fixing auth, fixing MCP config, or running the prompt directly.
+  - Prompt previews include likely matching skills and tools, while slash-command previews show whether the command is mostly read-only or stateful.
 - **2026-04-18** ⚙️ **v0.1.7** — Packaging & TUI polish:
   - Install script now links `oh`, `ohmo`, and `openharness` into `~/.local/bin` instead of prepending the virtualenv `bin` directory to `PATH`, which avoids clobbering Conda-managed shells.
   - React TUI now supports `Shift+Enter` to insert a newline while keeping plain `Enter` as submit.
@@ -335,6 +339,43 @@ oh -p "List all functions in main.py" --output-format json
 # Stream JSON events in real-time
 oh -p "Fix the bug" --output-format stream-json
 ```
+
+### Dry Run (Safe Preview)
+
+Use `--dry-run` when you want to inspect what OpenHarness would use before any live execution starts.
+
+```bash
+# Preview an interactive session setup
+oh --dry-run
+
+# Preview one prompt without executing the model or tools
+oh --dry-run -p "Review this bug fix and grep for failing tests"
+
+# Preview a slash command path
+oh --dry-run -p "/plugin list"
+
+# Get structured output for scripts or channels
+oh --dry-run -p "Explain this repository" --output-format json
+```
+
+Dry-run is intentionally static:
+
+- It does **not** call the model
+- It does **not** execute tools or spawn subagents
+- It does **not** connect to MCP servers
+- It **does** resolve settings, auth status, prompt assembly, skills, commands, tools, and obvious MCP config problems
+
+Readiness levels:
+
+- `ready`: configuration looks usable; the next suggested action is usually to run the prompt directly
+- `warning`: OpenHarness can resolve the session, but something important still looks wrong, such as broken MCP config or missing auth for later model work
+- `blocked`: the requested path will not run successfully as-is, for example an unknown slash command or a prompt that cannot resolve a runtime client
+
+`next actions` in the dry-run output tell you the shortest fix or follow-up step, such as:
+
+- run `oh auth login`
+- fix or disable broken MCP configuration
+- run the prompt directly with `oh -p "..."` or open the interactive UI with `oh`
 
 ## 🔌 Provider Compatibility
 
