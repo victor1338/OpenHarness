@@ -24,6 +24,7 @@ from openharness.engine.messages import (
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
+    sanitize_conversation_messages,
 )
 from openharness.engine.stream_events import CompactProgressEvent
 from openharness.hooks import HookEvent, HookExecutor
@@ -256,8 +257,7 @@ def try_context_collapse(
     if len(messages) <= preserve_recent + 2:
         return None
 
-    older = messages[:-preserve_recent]
-    newer = messages[-preserve_recent:]
+    older, newer = _split_preserving_tool_pairs(messages, preserve_recent=preserve_recent)
     changed = False
     collapsed_older: list[ConversationMessage] = []
     for message in older:
@@ -404,6 +404,53 @@ def build_post_compact_messages(result: CompactionResult) -> list[ConversationMe
         *attachment_messages,
         *hook_messages,
     ]
+
+
+def _boundary_crosses_tool_pair(previous: ConversationMessage, current: ConversationMessage) -> bool:
+    """Return True when a preserve boundary would split a tool_use/result pair."""
+
+    if previous.role != "assistant" or current.role != "user":
+        return False
+    pending_tool_ids = {block.id for block in previous.content if isinstance(block, ToolUseBlock)}
+    if not pending_tool_ids:
+        return False
+    result_ids = {block.tool_use_id for block in current.content if isinstance(block, ToolResultBlock)}
+    return bool(pending_tool_ids & result_ids)
+
+
+def _split_preserving_tool_pairs(
+    messages: list[ConversationMessage],
+    *,
+    preserve_recent: int,
+) -> tuple[list[ConversationMessage], list[ConversationMessage]]:
+    """Split older/newer segments without cutting through a tool_use/result pair.
+
+    The preserved segment is also sanitized so trailing orphan tool_use blocks
+    never survive the compaction boundary.
+    """
+
+    if len(messages) <= preserve_recent:
+        return [], sanitize_conversation_messages(list(messages))
+
+    split_index = max(0, len(messages) - preserve_recent)
+    while split_index > 0 and _boundary_crosses_tool_pair(messages[split_index - 1], messages[split_index]):
+        split_index -= 1
+
+    older = list(messages[:split_index])
+    newer = sanitize_conversation_messages(list(messages[split_index:]))
+    return older, newer
+
+
+def _sanitize_compaction_segments(result: CompactionResult) -> None:
+    """Normalize summary+preserved messages into a provider-safe sequence."""
+
+    if not result.summary_messages and not result.messages_to_keep:
+        return
+    combined = [*result.summary_messages, *result.messages_to_keep]
+    sanitized = sanitize_conversation_messages(combined)
+    summary_count = len(result.summary_messages)
+    result.summary_messages = sanitized[:summary_count]
+    result.messages_to_keep = sanitized[summary_count:]
 
 
 def _create_recent_attachments_attachment_if_needed(
@@ -625,6 +672,7 @@ def _build_compact_attachments(
 
 
 def _finalize_compaction_result(result: CompactionResult) -> CompactionResult:
+    _sanitize_compaction_segments(result)
     messages = build_post_compact_messages(result)
     result.compact_metadata.setdefault("post_compact_message_count", len(messages))
     result.compact_metadata.setdefault("post_compact_token_count", estimate_message_tokens(messages))
@@ -779,8 +827,7 @@ def try_session_memory_compaction(
     """Cheap deterministic compaction for long chats before full LLM compaction."""
     if len(messages) <= preserve_recent + 4:
         return None
-    older = messages[:-preserve_recent]
-    newer = messages[-preserve_recent:]
+    older, newer = _split_preserving_tool_pairs(messages, preserve_recent=preserve_recent)
     summary_message = _build_session_memory_message(older)
     if summary_message is None:
         return None
@@ -1023,8 +1070,7 @@ async def compact_conversation(
     log.info("Compacting conversation: %d messages, ~%d tokens", len(messages), pre_compact_tokens)
 
     # Step 2: split into older (summarize) and newer (preserve)
-    older = messages[:-preserve_recent]
-    newer = messages[-preserve_recent:]
+    older, newer = _split_preserving_tool_pairs(messages, preserve_recent=preserve_recent)
 
     # Step 3: build compact request — send older messages + compact prompt
     compact_prompt = get_compact_prompt(custom_instructions)
@@ -1541,19 +1587,18 @@ def compact_messages(
 ) -> list[ConversationMessage]:
     """Replace older conversation history with a synthetic summary (legacy)."""
     if len(messages) <= preserve_recent:
-        return list(messages)
-    older = messages[:-preserve_recent]
-    newer = messages[-preserve_recent:]
+        return sanitize_conversation_messages(list(messages))
+    older, newer = _split_preserving_tool_pairs(messages, preserve_recent=preserve_recent)
     summary = summarize_messages(older)
     if not summary:
         return list(newer)
-    return [
+    return sanitize_conversation_messages([
         ConversationMessage(
             role="user",
             content=[TextBlock(text=f"[conversation summary]\n{summary}")],
         ),
         *newer,
-    ]
+    ])
 
 
 __all__ = [

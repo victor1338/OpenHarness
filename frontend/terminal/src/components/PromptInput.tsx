@@ -6,6 +6,15 @@ import {useTheme} from '../theme/ThemeContext.js';
 import {Spinner} from './Spinner.js';
 
 const noop = (): void => {};
+const BACKSPACE_CONTROL_PATTERN = /^[\b\u007f]+$/;
+
+export function getBackspaceDeleteCount(sequence: string): number {
+	if (!sequence || !BACKSPACE_CONTROL_PATTERN.test(sequence)) {
+		return 1;
+	}
+
+	return [...sequence].length;
+}
 
 function MultilineTextInput({
 	value,
@@ -98,8 +107,9 @@ function MultilineTextInput({
 				if (cursorOffset === 0) {
 					return;
 				}
-				const nextValue = value.slice(0, cursorOffset - 1) + value.slice(cursorOffset);
-				setCursorOffset(cursorOffset - 1);
+				const deleteCount = Math.min(cursorOffset, getBackspaceDeleteCount(lastSequenceRef.current || input));
+				const nextValue = value.slice(0, cursorOffset - deleteCount) + value.slice(cursorOffset);
+				setCursorOffset(cursorOffset - deleteCount);
 				commitValue(nextValue);
 				return;
 			}
@@ -108,12 +118,17 @@ function MultilineTextInput({
 				// Ink reports the common DEL byte (`0x7f`) as `delete`, even though
 				// many terminals emit it for the Backspace key. Use the raw sequence
 				// to distinguish that case from a true forward-delete escape sequence.
-				if (lastSequenceRef.current === '\x7f' || lastSequenceRef.current === '\x1b\x7f') {
+				if (
+					lastSequenceRef.current === '\x7f' ||
+					lastSequenceRef.current === '\x1b\x7f' ||
+					BACKSPACE_CONTROL_PATTERN.test(lastSequenceRef.current)
+				) {
 					if (cursorOffset === 0) {
 						return;
 					}
-					const nextValue = value.slice(0, cursorOffset - 1) + value.slice(cursorOffset);
-					setCursorOffset(cursorOffset - 1);
+					const deleteCount = Math.min(cursorOffset, getBackspaceDeleteCount(lastSequenceRef.current));
+					const nextValue = value.slice(0, cursorOffset - deleteCount) + value.slice(cursorOffset);
+					setCursorOffset(cursorOffset - deleteCount);
 					commitValue(nextValue);
 					return;
 				}

@@ -8,7 +8,7 @@ import pytest
 
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolUseBlock
+from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 from openharness.hooks import HookEvent
 from openharness.services import (
     build_post_compact_messages,
@@ -51,6 +51,53 @@ def test_compact_and_summarize_messages():
     assert len(compacted) == 3
     assert "[conversation summary]" in compacted[0].text
     assert estimate_conversation_tokens(compacted) >= 1
+
+
+def test_compact_messages_shifts_boundary_to_keep_tool_pair_intact():
+    messages = [
+        ConversationMessage.from_user_text("first"),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="toolu_pair", name="read_file", input={"path": "x"})],
+        ),
+        ConversationMessage(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="toolu_pair", content="ok", is_error=False)],
+        ),
+        ConversationMessage(role="assistant", content=[TextBlock(text="done")]),
+    ]
+
+    compacted = compact_messages(messages, preserve_recent=2)
+
+    assert any(
+        isinstance(block, ToolUseBlock) and block.id == "toolu_pair"
+        for message in compacted
+        for block in message.content
+    )
+    assert any(
+        isinstance(block, ToolResultBlock) and block.tool_use_id == "toolu_pair"
+        for message in compacted
+        for block in message.content
+    )
+
+
+def test_compact_messages_drops_dangling_preserved_tool_use():
+    messages = [
+        ConversationMessage.from_user_text("first"),
+        ConversationMessage(role="assistant", content=[TextBlock(text="second")]),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="toolu_orphan", name="edit_file", input={"path": "x"})],
+        ),
+    ]
+
+    compacted = compact_messages(messages, preserve_recent=1)
+
+    assert not any(
+        isinstance(block, ToolUseBlock) and block.id == "toolu_orphan"
+        for message in compacted
+        for block in message.content
+    )
 
 
 class _CompactApiClient:
@@ -221,6 +268,70 @@ async def test_compact_conversation_runs_hooks_and_preserves_carryover_state(tmp
     assert "[Compact attachment: async_agents]" in joined
     assert "[Compact attachment: recent_work_log]" in joined
     assert "41 passed" in joined
+
+
+@pytest.mark.asyncio
+async def test_compact_conversation_keeps_tool_pair_when_boundary_would_split_it():
+    messages = [
+        ConversationMessage.from_user_text("alpha"),
+        ConversationMessage(role="assistant", content=[TextBlock(text="beta")]),
+        ConversationMessage(role="user", content=[TextBlock(text="gamma")]),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="toolu_pair", name="read_file", input={"path": "demo.txt"})],
+        ),
+        ConversationMessage(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="toolu_pair", content="contents", is_error=False)],
+        ),
+        ConversationMessage(role="assistant", content=[TextBlock(text="used the tool")]),
+        ConversationMessage(role="user", content=[TextBlock(text="continue")]),
+    ]
+
+    compacted = await compact_conversation(
+        messages,
+        api_client=_CompactApiClient(["<summary>condensed</summary>"]),
+        model="claude-test",
+        preserve_recent=3,
+    )
+
+    rebuilt = build_post_compact_messages(compacted)
+    pair_positions: list[tuple[int, str]] = []
+    for index, message in enumerate(rebuilt):
+        for block in message.content:
+            if isinstance(block, ToolUseBlock) and block.id == "toolu_pair":
+                pair_positions.append((index, "use"))
+            if isinstance(block, ToolResultBlock) and block.tool_use_id == "toolu_pair":
+                pair_positions.append((index, "result"))
+
+    assert pair_positions == [(2, "use"), (3, "result")]
+
+
+@pytest.mark.asyncio
+async def test_compact_conversation_drops_orphan_preserved_tool_use():
+    messages = [
+        ConversationMessage.from_user_text("alpha"),
+        ConversationMessage(role="assistant", content=[TextBlock(text="beta")]),
+        ConversationMessage(role="user", content=[TextBlock(text="gamma")]),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="toolu_orphan", name="edit_file", input={"path": "demo.txt"})],
+        ),
+    ]
+
+    compacted = await compact_conversation(
+        messages,
+        api_client=_CompactApiClient(["<summary>condensed</summary>"]),
+        model="claude-test",
+        preserve_recent=1,
+    )
+
+    rebuilt = build_post_compact_messages(compacted)
+    assert not any(
+        isinstance(block, ToolUseBlock) and block.id == "toolu_orphan"
+        for message in rebuilt
+        for block in message.content
+    )
 
 
 @pytest.mark.asyncio
