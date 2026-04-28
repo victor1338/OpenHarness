@@ -67,6 +67,9 @@ def _is_prompt_too_long_error(exc: Exception) -> bool:
             "too many tokens",
             "too large for the model",
             "maximum context length",
+            "exceed_context",
+            "exceeds the available context size",
+            "available context size",
         )
     )
 

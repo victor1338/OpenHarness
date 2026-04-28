@@ -1051,7 +1051,11 @@ def create_default_command_registry(
             path = install_plugin_from_path(tokens[1])
             return CommandResult(message=f"Installed plugin to {path}")
         if tokens[0] == "uninstall" and len(tokens) == 2:
-            if uninstall_plugin(tokens[1]):
+            try:
+                removed = uninstall_plugin(tokens[1])
+            except ValueError:
+                return CommandResult(message=f"Invalid plugin name '{tokens[1]}'")
+            if removed:
                 return CommandResult(message=f"Uninstalled plugin '{tokens[1]}'")
             return CommandResult(message=f"Plugin '{tokens[1]}' not found")
         plugins = load_plugins(settings, context.cwd, extra_roots=context.extra_plugin_roots)
@@ -1843,7 +1847,15 @@ def create_default_command_registry(
     registry.register(SlashCommand("rewind", "Remove the latest conversation turn(s)", _rewind_handler))
     registry.register(SlashCommand("files", "List files in the current workspace", _files_handler))
     registry.register(SlashCommand("init", "Initialize project OpenHarness files", _init_handler))
-    registry.register(SlashCommand("bridge", "Inspect bridge helpers and spawn bridge sessions", _bridge_handler))
+    registry.register(
+        SlashCommand(
+            "bridge",
+            "Inspect bridge helpers and spawn bridge sessions",
+            _bridge_handler,
+            remote_invocable=False,
+            remote_admin_opt_in=True,
+        )
+    )
     registry.register(SlashCommand("login", "Show auth status or store an API key", _login_handler))
     registry.register(SlashCommand("logout", "Clear the stored API key", _logout_handler))
     registry.register(SlashCommand("feedback", "Save CLI feedback to the local feedback log", _feedback_handler))

@@ -240,6 +240,14 @@ def default_provider_profiles() -> dict[str, ProviderProfile]:
             default_model="MiniMax-M2.7",
             base_url="https://api.minimax.io/v1",
         ),
+        "qwen": ProviderProfile(
+            label="Qwen (DashScope)",
+            provider="dashscope",
+            api_format="openai",
+            auth_source="dashscope_api_key",
+            default_model="qwen-plus",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
     }
 
 

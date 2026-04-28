@@ -65,6 +65,10 @@ async def test_glob_and_grep(tmp_path: Path):
     glob_result = await GlobTool().execute(GlobToolInput(pattern="*.py"), context)
     assert glob_result.output.splitlines() == ["a.py", "b.py"]
 
+    aliased_input = GlobTool().input_model.model_validate({"path": "*.py"})
+    aliased_glob_result = await GlobTool().execute(aliased_input, context)
+    assert aliased_glob_result.output.splitlines() == ["a.py", "b.py"]
+
     grep_result = await GrepTool().execute(
         GrepToolInput(pattern=r"def\s+beta", file_glob="*.py"),
         context,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shlex
@@ -17,6 +18,31 @@ from openharness.tasks.types import TaskRecord, TaskStatus, TaskType
 from openharness.utils.shell import create_shell_subprocess
 
 log = logging.getLogger(__name__)
+_TASK_RESTART_NOTICE = "[OpenHarness] Agent task restarted; prior interactive context was not preserved.\n"
+
+
+def _encode_task_worker_payload(data: str) -> bytes:
+    """Serialize one worker input as a single JSON line.
+
+    Plain-text prompts may contain embedded newlines, so they cannot be written
+    directly to a readline()-based worker protocol. We wrap them in a JSON
+    object with a ``text`` field, while preserving already-structured payloads
+    emitted by teammate backends.
+    """
+
+    stripped = data.rstrip("\n")
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict) and isinstance(payload.get("text"), str):
+        framed = stripped
+    elif "\n" not in stripped and "\r" not in stripped:
+        framed = stripped
+    else:
+        framed = json.dumps({"text": stripped}, ensure_ascii=False)
+    return (framed + "\n").encode("utf-8")
 
 CompletionListener = Callable[[TaskRecord], Awaitable[None] | None]
 
@@ -155,16 +181,17 @@ class BackgroundTaskManager:
     async def write_to_task(self, task_id: str, data: str) -> None:
         """Write one line to task stdin, auto-resuming local agents when needed."""
         task = self._require_task(task_id)
+        payload = _encode_task_worker_payload(data)
         async with self._input_locks[task_id]:
             process = await self._ensure_writable_process(task)
-            process.stdin.write((data.rstrip("\n") + "\n").encode("utf-8"))
+            process.stdin.write(payload)
             try:
                 await process.stdin.drain()
             except (BrokenPipeError, ConnectionResetError):
                 if task.type not in {"local_agent", "remote_agent", "in_process_teammate"}:
                     raise ValueError(f"Task {task_id} does not accept input") from None
                 process = await self._restart_agent_task(task)
-                process.stdin.write((data.rstrip("\n") + "\n").encode("utf-8"))
+                process.stdin.write(payload)
                 await process.stdin.drain()
 
     def read_task_output(self, task_id: str, *, max_bytes: int = 12000) -> str:
@@ -267,10 +294,13 @@ class BackgroundTaskManager:
 
         restart_count = int(task.metadata.get("restart_count", "0")) + 1
         task.metadata["restart_count"] = str(restart_count)
+        task.metadata["status_note"] = "Task restarted; prior interactive context was not preserved."
         task.status = "running"
         task.started_at = time.time()
         task.ended_at = None
         task.return_code = None
+        with task.output_file.open("ab") as handle:
+            handle.write(_TASK_RESTART_NOTICE.encode("utf-8"))
         return await self._start_process(task.id)
 
     async def _notify_completion_listeners(self, task: TaskRecord) -> None:

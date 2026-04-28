@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +72,7 @@ DEFAULT_GAP_THRESHOLD_MINUTES = 60
 
 # Token estimation padding (conservative)
 TOKEN_ESTIMATION_PADDING = 4 / 3
+_DEFAULT_VISION_IMAGE_TOKEN_ESTIMATE = 3_072
 
 # Default context windows per model family
 _DEFAULT_CONTEXT_WINDOW = 200_000
@@ -113,6 +115,7 @@ class CompactionResult:
 def estimate_message_tokens(messages: list[ConversationMessage]) -> int:
     """Estimate total tokens for a conversation, including the 4/3 padding."""
     total = 0
+    image_token_estimate = _vision_token_budget_per_image()
     for msg in messages:
         for block in msg.content:
             if isinstance(block, TextBlock):
@@ -122,12 +125,50 @@ def estimate_message_tokens(messages: list[ConversationMessage]) -> int:
             elif isinstance(block, ToolUseBlock):
                 total += estimate_tokens(block.name)
                 total += estimate_tokens(str(block.input))
+            elif isinstance(block, ImageBlock):
+                total += image_token_estimate
     return int(total * TOKEN_ESTIMATION_PADDING)
 
 
 def estimate_conversation_tokens(messages: list[ConversationMessage]) -> int:
     """Alias kept for backward compatibility."""
     return estimate_message_tokens(messages)
+
+
+def _vision_token_budget_per_image() -> int:
+    raw = os.environ.get("OPENHARNESS_IMAGE_TOKEN_ESTIMATE", "").strip()
+    if raw:
+        try:
+            return max(64, int(raw))
+        except ValueError:
+            log.warning("Ignoring invalid OPENHARNESS_IMAGE_TOKEN_ESTIMATE=%r", raw)
+    return _DEFAULT_VISION_IMAGE_TOKEN_ESTIMATE
+
+
+def _replace_images_with_compaction_placeholders(
+    messages: list[ConversationMessage],
+) -> list[ConversationMessage]:
+    """Strip image payloads from summarizer-only compact requests."""
+    replaced: list[ConversationMessage] = []
+    for message in messages:
+        next_content: list[ContentBlock] = []
+        changed = False
+        for block in message.content:
+            if isinstance(block, ImageBlock):
+                changed = True
+                label = block.source_path.strip() or "inline"
+                next_content.append(
+                    TextBlock(
+                        text=f"[Image omitted from compaction summarization; source: {label}.]\n"
+                    )
+                )
+            else:
+                next_content.append(block)
+        if changed:
+            replaced.append(message.model_copy(update={"content": next_content}))
+        else:
+            replaced.append(message)
+    return replaced
 
 
 def _sanitize_metadata(value: Any) -> Any:
@@ -215,6 +256,10 @@ def _is_prompt_too_long_error(exc: Exception) -> bool:
             "context window",
             "too many tokens",
             "too large for the model",
+            "maximum context length",
+            "exceed_context",
+            "exceeds the available context size",
+            "available context size",
         )
     )
 
@@ -1160,6 +1205,9 @@ async def compact_conversation(
 
     async def _collect_summary(summary_request_messages: list[ConversationMessage]) -> str:
         collected = ""
+        summary_request_messages = _replace_images_with_compaction_placeholders(
+            summary_request_messages
+        )
         stream = api_client.stream_message(
             ApiMessageRequest(
                 model=model,

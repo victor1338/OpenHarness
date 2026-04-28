@@ -6,7 +6,7 @@ import asyncio
 import shutil
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
@@ -14,7 +14,10 @@ from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 class GlobToolInput(BaseModel):
     """Arguments for the glob tool."""
 
-    pattern: str = Field(description="Glob pattern relative to the working directory")
+    pattern: str = Field(
+        description="Glob pattern relative to the working directory",
+        validation_alias=AliasChoices("pattern", "path"),
+    )
     root: str | None = Field(default=None, description="Optional search root")
     limit: int = Field(default=200, ge=1, le=5000)
 
@@ -62,6 +65,9 @@ def _looks_like_git_repo(path: Path) -> bool:
     return False
 
 
+_GLOB_RG_TIMEOUT_SECONDS = 30.0
+
+
 async def _glob(root: Path, pattern: str, *, limit: int) -> list[str]:
     """Fast glob implementation.
 
@@ -86,18 +92,19 @@ async def _glob(root: Path, pattern: str, *, limit: int) -> list[str]:
                 cmd,
                 cwd=root,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
         else:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(root),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
 
         lines: list[str] = []
-        try:
+
+        async def _read_stdout() -> None:
             assert process.stdout is not None
             while len(lines) < limit:
                 raw = await process.stdout.readline()
@@ -106,10 +113,26 @@ async def _glob(root: Path, pattern: str, *, limit: int) -> list[str]:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if line:
                     lines.append(line)
+
+        try:
+            try:
+                await asyncio.wait_for(_read_stdout(), timeout=_GLOB_RG_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                pass
         finally:
-            if len(lines) >= limit and process.returncode is None:
-                process.terminate()
-            await process.wait()
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
 
         # Sorting keeps unit tests and user output deterministic for small results.
         lines.sort()

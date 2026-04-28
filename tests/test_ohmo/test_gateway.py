@@ -465,6 +465,54 @@ async def test_runtime_pool_blocks_local_only_commands_from_remote_messages(tmp_
 
 
 @pytest.mark.asyncio
+async def test_runtime_pool_blocks_bridge_spawn_from_remote_messages(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    handler_called = False
+
+    async def forbidden_bridge_handler(args, context):
+        nonlocal handler_called
+        handler_called = True
+        return CommandResult(message="spawned")
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+        command = SlashCommand(
+            "bridge",
+            "Inspect bridge helpers and spawn bridge sessions",
+            forbidden_bridge_handler,
+            remote_invocable=False,
+            remote_admin_opt_in=True,
+        )
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: (command, "spawn id")),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="/bridge spawn id")
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    assert handler_called is False
+    assert updates[-1].kind == "final"
+    assert updates[-1].text == "/bridge is only available in the local OpenHarness UI."
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_allows_opted_in_remote_admin_commands(tmp_path, monkeypatch, caplog):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)

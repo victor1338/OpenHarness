@@ -314,6 +314,12 @@ def test_openai_client_init_passes_timeout(monkeypatch):
     assert captured["timeout"] == 45.0
 
 
+def test_openai_client_uses_bearer_authorization_header():
+    client = OpenAICompatibleClient(api_key="test-key", base_url="https://example.com/v1")
+
+    assert client._client.default_headers["Authorization"] == "Bearer test-key"
+
+
 
 class TestStreamMessageTokenParams:
     @pytest.mark.asyncio

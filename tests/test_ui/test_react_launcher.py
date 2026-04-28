@@ -141,6 +141,62 @@ async def test_run_task_worker_reads_one_shot_json_line(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_task_worker_decodes_multiline_json_payload(monkeypatch):
+    seen = []
+
+    class _FakeStdin:
+        def __init__(self):
+            self._lines = iter([
+                '{"text":"line 1\\nline 2\\nline 3","from":"coordinator"}\n',
+            ])
+
+        def readline(self):
+            return next(self._lines, "")
+
+    async def _build_runtime(**kwargs):
+        return SimpleNamespace(
+            cwd=kwargs.get("cwd"),
+            engine=SimpleNamespace(),
+            external_api_client=False,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            current_settings=lambda: None,
+            current_plugins=lambda: [],
+            hook_summary=lambda: "",
+            plugin_summary=lambda: "",
+            mcp_summary=lambda: "",
+            app_state=SimpleNamespace(set=lambda **_kwargs: None),
+            mcp_manager=SimpleNamespace(close=lambda: None, list_statuses=lambda: []),
+            hook_executor=SimpleNamespace(execute=lambda *_args, **_kwargs: None, update_registry=lambda *_a, **_k: None),
+            commands=SimpleNamespace(lookup=lambda _line: None),
+            session_backend=SimpleNamespace(save_snapshot=lambda **_kwargs: None),
+            enforce_max_turns=False,
+            session_id="s1",
+        )
+
+    async def _start_runtime(_bundle):
+        return None
+
+    async def _handle_line(bundle, line, **kwargs):
+        del bundle, kwargs
+        seen.append(line)
+        return True
+
+    async def _close_runtime(_bundle):
+        return None
+
+    monkeypatch.setattr("openharness.ui.app.build_runtime", _build_runtime)
+    monkeypatch.setattr("openharness.ui.app.start_runtime", _start_runtime)
+    monkeypatch.setattr("openharness.ui.app.handle_line", _handle_line)
+    monkeypatch.setattr("openharness.ui.app.close_runtime", _close_runtime)
+    monkeypatch.setattr("openharness.ui.app.sys.stdin", _FakeStdin())
+
+    await run_task_worker(cwd="/tmp/demo")
+
+    assert seen == ["line 1\nline 2\nline 3"]
+
+
+@pytest.mark.asyncio
 async def test_run_print_mode_waits_for_coordinator_async_agents(monkeypatch):
     class _FakeEngine:
         def __init__(self) -> None:
@@ -231,14 +287,17 @@ async def test_run_print_mode_waits_for_coordinator_async_agents(monkeypatch):
     monkeypatch.setattr("openharness.ui.app.start_runtime", _start_runtime)
     monkeypatch.setattr("openharness.ui.app.handle_line", _handle_line)
     monkeypatch.setattr("openharness.ui.app.close_runtime", _close_runtime)
-    monkeypatch.setattr("openharness.ui.app.get_task_manager", lambda: fake_manager)
+    monkeypatch.setattr("openharness.ui.coordinator_drain.get_task_manager", lambda: fake_manager)
     monkeypatch.setattr("openharness.ui.app.is_coordinator_mode", lambda: True)
-    monkeypatch.setattr("openharness.ui.app.build_runtime_system_prompt", lambda *args, **kwargs: "coordinator")
+    monkeypatch.setattr(
+        "openharness.ui.coordinator_drain.build_runtime_system_prompt",
+        lambda *args, **kwargs: "coordinator",
+    )
 
     async def _sleep(_seconds):
         return None
 
-    monkeypatch.setattr("openharness.ui.app.asyncio.sleep", _sleep)
+    monkeypatch.setattr("openharness.ui.coordinator_drain.asyncio.sleep", _sleep)
 
     await run_print_mode(prompt="research this", cwd="/tmp/demo")
 

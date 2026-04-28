@@ -186,14 +186,14 @@ async def _rg_grep(
             cmd,
             cwd=root,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
     else:
         process = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(root),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
             limit=8 * 1024 * 1024,  # 8 MB per line — avoids LimitOverrunError on long lines
         )
 
@@ -254,14 +254,14 @@ async def _rg_grep_file(
             cmd,
             cwd=path.parent,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
     else:
         process = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(path.parent),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
             limit=8 * 1024 * 1024,  # 8 MB per line — avoids LimitOverrunError on long lines
         )
 

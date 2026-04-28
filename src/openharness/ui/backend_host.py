@@ -10,12 +10,14 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Coroutine
 from uuid import uuid4
 
 from openharness.api.client import SupportsStreamingMessages
 from openharness.auth.manager import AuthManager
 from openharness.config.settings import CLAUDE_MODEL_ALIAS_OPTIONS, resolve_model_setting
 from openharness.bridge import get_bridge_manager
+from openharness.coordinator.coordinator_mode import is_coordinator_mode
 from openharness.themes import list_themes
 from openharness.engine.stream_events import (
     AssistantTextDelta,
@@ -30,6 +32,7 @@ from openharness.engine.stream_events import (
 )
 from openharness.output_styles import load_output_styles
 from openharness.tasks import get_task_manager
+from openharness.ui.coordinator_drain import drain_coordinator_async_agents
 from openharness.ui.protocol import BackendEvent, FrontendRequest, TranscriptItem
 from openharness.ui.runtime import build_runtime, close_runtime, handle_line, start_runtime
 from openharness.services.session_backend import SessionBackend
@@ -76,6 +79,7 @@ class ReactBackendHost:
         self._permission_lock = asyncio.Lock()
         self._busy = False
         self._running = True
+        self._active_request_task: asyncio.Task[bool] | None = None
         # Track last tool input per name for rich event emission
         self._last_tool_inputs: dict[str, dict] = {}
 
@@ -117,6 +121,9 @@ class ReactBackendHost:
                 if request.type == "shutdown":
                     await self._emit(BackendEvent(type="shutdown"))
                     break
+                if request.type == "interrupt":
+                    await self._interrupt_active_request()
+                    continue
                 if request.type in ("permission_response", "question_response"):
                     continue
                 if request.type == "list_sessions":
@@ -131,9 +138,11 @@ class ReactBackendHost:
                         continue
                     self._busy = True
                     try:
-                        should_continue = await self._apply_select_command(
-                            request.command or "",
-                            request.value or "",
+                        should_continue = await self._run_active_request(
+                            self._apply_select_command(
+                                request.command or "",
+                                request.value or "",
+                            )
                         )
                     finally:
                         self._busy = False
@@ -152,7 +161,7 @@ class ReactBackendHost:
                     continue
                 self._busy = True
                 try:
-                    should_continue = await self._process_line(line)
+                    should_continue = await self._run_active_request(self._process_line(line))
                 finally:
                     self._busy = False
                 if not should_continue:
@@ -190,7 +199,36 @@ class ReactBackendHost:
                 if not future.done():
                     future.set_result(request.answer or "")
                 continue
+            if request.type == "interrupt":
+                await self._interrupt_active_request()
+                continue
             await self._request_queue.put(request)
+
+    async def _run_active_request(self, awaitable: Coroutine[Any, Any, bool]) -> bool:
+        task = asyncio.create_task(awaitable)
+        self._active_request_task = task
+        try:
+            return await task
+        except asyncio.CancelledError:
+            await self._emit(
+                BackendEvent(
+                    type="transcript_item",
+                    item=TranscriptItem(role="system", text="Interrupted by user."),
+                )
+            )
+            await self._emit(self._status_snapshot())
+            await self._emit(BackendEvent.tasks_snapshot(get_task_manager().list_tasks()))
+            await self._emit(BackendEvent(type="line_complete"))
+            return True
+        finally:
+            if self._active_request_task is task:
+                self._active_request_task = None
+
+    async def _interrupt_active_request(self) -> None:
+        task = self._active_request_task
+        if task is None or task.done():
+            return
+        task.cancel()
 
     async def _process_line(self, line: str, *, transcript_line: str | None = None) -> bool:
         assert self._bundle is not None
@@ -310,6 +348,13 @@ class ReactBackendHost:
             render_event=_render_event,
             clear_output=_clear_output,
         )
+        if is_coordinator_mode():
+            await drain_coordinator_async_agents(
+                self._bundle,
+                prompt_seed=line,
+                print_system=_print_system,
+                render_event=_render_event,
+            )
         await self._emit(self._status_snapshot())
         await self._emit(BackendEvent.tasks_snapshot(get_task_manager().list_tasks()))
         await self._emit(BackendEvent(type="line_complete"))

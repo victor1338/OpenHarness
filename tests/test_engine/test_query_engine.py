@@ -35,7 +35,7 @@ from openharness.engine.messages import ToolResultBlock
 from openharness.hooks import HookExecutionContext, HookExecutor, HookEvent
 from openharness.hooks.loader import HookRegistry
 from openharness.hooks.schemas import PromptHookDefinition
-from openharness.engine.query import QueryContext, _execute_tool_call
+from openharness.engine.query import QueryContext, _execute_tool_call, _is_prompt_too_long_error
 
 
 @dataclass
@@ -163,6 +163,12 @@ class _NoopApiClient:
         del request
         if False:
             yield None
+
+
+def test_query_prompt_too_long_detection_handles_llama_cpp_errors():
+    assert _is_prompt_too_long_error(
+        RequestFailure("exceed_context_size_error: prompt exceeds the available context size")
+    )
 
 
 @pytest.mark.asyncio
