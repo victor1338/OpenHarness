@@ -25,6 +25,7 @@ from openharness.services.compact import (
     auto_compact_if_needed,
     estimate_message_tokens as estimate_compact_message_tokens,
     get_autocompact_threshold,
+    microcompact_messages,
     should_autocompact,
     try_context_collapse,
     try_session_memory_compaction,
@@ -166,6 +167,114 @@ def test_try_context_collapse_trims_oversized_messages():
 
     assert result is not None
     assert "[collapsed" in result[0].text
+
+
+def test_try_context_collapse_trims_oversized_tool_results():
+    giant = ("snapshot node " * 1200).strip()
+    messages = [
+        ConversationMessage.from_user_text("open page"),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="toolu_snapshot", name="mcp__playwright__browser_snapshot", input={})],
+        ),
+        ConversationMessage(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="toolu_snapshot", content=giant, is_error=False)],
+        ),
+        ConversationMessage(role="assistant", content=[TextBlock(text="I inspected the snapshot")]),
+        ConversationMessage(role="user", content=[TextBlock(text="latest")]),
+        ConversationMessage(role="assistant", content=[TextBlock(text="keep recent")]),
+    ]
+
+    result = try_context_collapse(messages, preserve_recent=2)
+
+    assert result is not None
+    collapsed_results = [
+        block
+        for message in result
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert len(collapsed_results) == 1
+    assert "[collapsed" in collapsed_results[0].content
+    assert collapsed_results[0].tool_use_id == "toolu_snapshot"
+
+
+def test_microcompact_compacts_mcp_results_while_preserving_recent():
+    messages = []
+    for index in range(3):
+        tool_id = f"toolu_snapshot_{index}"
+        messages.extend(
+            [
+                ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id=tool_id,
+                            name="mcp__playwright__browser_snapshot",
+                            input={},
+                        )
+                    ],
+                ),
+                ConversationMessage(
+                    role="user",
+                    content=[
+                        ToolResultBlock(
+                            tool_use_id=tool_id,
+                            content=f"snapshot {index} " * 600,
+                            is_error=False,
+                        )
+                    ],
+                ),
+            ]
+        )
+
+    compacted, tokens_saved = microcompact_messages(messages, keep_recent=1)
+
+    assert tokens_saved > 0
+    results = [
+        block
+        for message in compacted
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert results[0].content == "[Old tool result content cleared]"
+    assert results[1].content == "[Old tool result content cleared]"
+    assert results[2].content.startswith("snapshot 2")
+
+
+def test_microcompact_compacts_large_non_allowlisted_results(monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_MICROCOMPACT_TOOL_RESULT_CHARS", "256")
+    messages = [
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="toolu_custom_0", name="custom_snapshot_tool", input={})],
+        ),
+        ConversationMessage(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="toolu_custom_0", content="A" * 512, is_error=False)],
+        ),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="toolu_custom_1", name="custom_snapshot_tool", input={})],
+        ),
+        ConversationMessage(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="toolu_custom_1", content="B" * 512, is_error=False)],
+        ),
+    ]
+
+    compacted, tokens_saved = microcompact_messages(messages, keep_recent=1)
+
+    assert tokens_saved > 0
+    results = [
+        block
+        for message in compacted
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert results[0].content == "[Old tool result content cleared]"
+    assert results[1].content == "B" * 512
 
 
 def test_compact_prompt_too_long_detection_handles_llama_cpp_errors():

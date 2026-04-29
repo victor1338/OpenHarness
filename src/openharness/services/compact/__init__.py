@@ -29,6 +29,7 @@ from openharness.engine.messages import (
 )
 from openharness.engine.stream_events import CompactProgressEvent
 from openharness.hooks import HookEvent, HookExecutor
+from openharness.services.tool_outputs import is_microcompactable_tool_result
 from openharness.services.token_estimation import estimate_tokens
 
 log = logging.getLogger(__name__)
@@ -313,6 +314,17 @@ def try_context_collapse(
                 if collapsed != block.text:
                     changed = True
                 new_blocks.append(TextBlock(text=collapsed))
+            elif isinstance(block, ToolResultBlock):
+                collapsed = _collapse_text(block.content)
+                if collapsed != block.content:
+                    changed = True
+                new_blocks.append(
+                    ToolResultBlock(
+                        tool_use_id=block.tool_use_id,
+                        content=collapsed,
+                        is_error=block.is_error,
+                    )
+                )
             else:
                 new_blocks.append(block)
         collapsed_older.append(ConversationMessage(role=message.role, content=new_blocks))
@@ -767,14 +779,25 @@ def _build_passthrough_compaction_result(
 
 def _collect_compactable_tool_ids(messages: list[ConversationMessage]) -> list[str]:
     """Walk messages and collect tool_use IDs whose results are compactable."""
-    ids: list[str] = []
+    ordered_ids: list[str] = []
+    tool_names: dict[str, str] = {}
+    result_content: dict[str, str] = {}
     for msg in messages:
-        if msg.role != "assistant":
-            continue
         for block in msg.content:
-            if isinstance(block, ToolUseBlock) and block.name in COMPACTABLE_TOOLS:
-                ids.append(block.id)
-    return ids
+            if isinstance(block, ToolUseBlock):
+                ordered_ids.append(block.id)
+                tool_names[block.id] = block.name
+            elif isinstance(block, ToolResultBlock):
+                result_content[block.tool_use_id] = block.content
+    return [
+        tool_id
+        for tool_id in ordered_ids
+        if tool_names.get(tool_id, "") in COMPACTABLE_TOOLS
+        or is_microcompactable_tool_result(
+            tool_names.get(tool_id, ""),
+            result_content.get(tool_id, ""),
+        )
+    ]
 
 
 def microcompact_messages(
