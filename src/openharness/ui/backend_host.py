@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from openharness.api.client import SupportsStreamingMessages
 from openharness.auth.manager import AuthManager
+from openharness.commands import MemoryCommandBackend
 from openharness.config.settings import CLAUDE_MODEL_ALIAS_OPTIONS, resolve_model_setting
 from openharness.bridge import get_bridge_manager
 from openharness.coordinator.coordinator_mode import is_coordinator_mode
@@ -64,6 +65,8 @@ class BackendHostConfig:
     session_backend: SessionBackend | None = None
     extra_skill_dirs: tuple[str, ...] = ()
     extra_plugin_roots: tuple[str, ...] = ()
+    memory_backend: MemoryCommandBackend | None = None
+    include_project_memory: bool = True
 
 
 class ReactBackendHost:
@@ -103,6 +106,8 @@ class ReactBackendHost:
             session_backend=self._config.session_backend,
             extra_skill_dirs=self._config.extra_skill_dirs,
             extra_plugin_roots=self._config.extra_plugin_roots,
+            memory_backend=self._config.memory_backend,
+            include_project_memory=self._config.include_project_memory,
         )
         await start_runtime(self._bundle)
         await self._emit(
@@ -804,6 +809,8 @@ async def run_backend_host(
     session_backend: SessionBackend | None = None,
     extra_skill_dirs: tuple[str | Path, ...] = (),
     extra_plugin_roots: tuple[str | Path, ...] = (),
+    memory_backend: MemoryCommandBackend | None = None,
+    include_project_memory: bool = True,
 ) -> int:
     """Run the structured React backend host."""
     if cwd:
@@ -826,6 +833,8 @@ async def run_backend_host(
             session_backend=session_backend,
             extra_skill_dirs=tuple(str(Path(path).expanduser().resolve()) for path in extra_skill_dirs),
             extra_plugin_roots=tuple(str(Path(path).expanduser().resolve()) for path in extra_plugin_roots),
+            memory_backend=memory_backend,
+            include_project_memory=include_project_memory,
         )
     )
     return await host.run()

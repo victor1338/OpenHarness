@@ -78,6 +78,7 @@ def build_runtime_system_prompt(
     latest_user_prompt: str | None = None,
     extra_skill_dirs: Iterable[str | Path] | None = None,
     extra_plugin_roots: Iterable[str | Path] | None = None,
+    include_project_memory: bool = True,
 ) -> str:
     """Build the runtime system prompt with project instructions and memory."""
     if is_coordinator_mode():
@@ -130,7 +131,7 @@ def build_runtime_system_prompt(
             if content:
                 sections.append(f"# {title}\n\n```md\n{content[:12000]}\n```")
 
-    if settings.memory.enabled:
+    if include_project_memory and settings.memory.enabled:
         memory_section = load_memory_prompt(
             cwd,
             max_entrypoint_lines=settings.memory.max_entrypoint_lines,

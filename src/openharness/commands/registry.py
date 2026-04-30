@@ -75,6 +75,18 @@ class CommandResult:
     submit_model: str | None = None
 
 
+@dataclass(frozen=True)
+class MemoryCommandBackend:
+    """Storage backend used by the generic ``/memory`` slash command."""
+
+    label: str
+    get_memory_dir: Callable[[], Path]
+    get_entrypoint: Callable[[], Path]
+    list_files: Callable[[], list[Path]]
+    add_entry: Callable[[str, str], Path]
+    remove_entry: Callable[[str], bool]
+
+
 @dataclass
 class CommandContext:
     """Context available to command handlers."""
@@ -90,6 +102,8 @@ class CommandContext:
     session_id: str | None = None
     extra_skill_dirs: Iterable[str | Path] | None = None
     extra_plugin_roots: Iterable[str | Path] | None = None
+    memory_backend: MemoryCommandBackend | None = None
+    include_project_memory: bool = True
 
 
 CommandHandler = Callable[[str, CommandContext], Awaitable[CommandResult]]
@@ -286,7 +300,11 @@ def create_default_command_registry(
 
     async def _context_handler(_: str, context: CommandContext) -> CommandResult:
         settings = load_settings()
-        prompt = build_runtime_system_prompt(settings, cwd=context.cwd)
+        prompt = build_runtime_system_prompt(
+            settings,
+            cwd=context.cwd,
+            include_project_memory=context.include_project_memory,
+        )
         return CommandResult(message=prompt)
 
     async def _summary_handler(args: str, context: CommandContext) -> CommandResult:
@@ -360,7 +378,8 @@ def create_default_command_registry(
 
     async def _stats_handler(_: str, context: CommandContext) -> CommandResult:
         settings = load_settings()
-        memory_count = len(list_memory_files(context.cwd))
+        memory_backend = _memory_backend_for_context(context)
+        memory_count = len(memory_backend.list_files())
         task_count = len(get_task_manager().list_tasks())
         tool_count = len(context.tool_registry.list_tools()) if context.tool_registry is not None else 0
         style = settings.output_style
@@ -380,25 +399,28 @@ def create_default_command_registry(
         )
 
     async def _memory_handler(args: str, context: CommandContext) -> CommandResult:
+        backend = _memory_backend_for_context(context)
         tokens = args.split(maxsplit=1)
         if not tokens:
-            memory_dir = get_project_memory_dir(context.cwd)
-            entrypoint = get_memory_entrypoint(context.cwd)
             return CommandResult(
-                message=f"Memory directory: {memory_dir}\nEntrypoint: {entrypoint}"
+                message=(
+                    f"Memory store: {backend.label}\n"
+                    f"Memory directory: {backend.get_memory_dir()}\n"
+                    f"Entrypoint: {backend.get_entrypoint()}"
+                )
             )
         action = tokens[0]
         rest = tokens[1] if len(tokens) == 2 else ""
         if action == "list":
-            memory_files = list_memory_files(context.cwd)
+            memory_files = backend.list_files()
             if not memory_files:
                 return CommandResult(message="No memory files.")
             return CommandResult(message="\n".join(path.name for path in memory_files))
         if action == "show" and rest:
-            memory_dir = get_project_memory_dir(context.cwd)
+            memory_dir = backend.get_memory_dir()
             path, invalid = _resolve_memory_entry_path(memory_dir, rest)
             if invalid:
-                return CommandResult(message="Memory entry path must stay within the project memory directory.")
+                return CommandResult(message="Memory entry path must stay within the configured memory directory.")
             if path is None:
                 return CommandResult(message=f"Memory entry not found: {rest}")
             if not path.exists():
@@ -408,10 +430,10 @@ def create_default_command_registry(
             title, separator, content = rest.partition("::")
             if not separator or not title.strip() or not content.strip():
                 return CommandResult(message="Usage: /memory add TITLE :: CONTENT")
-            path = add_memory_entry(context.cwd, title.strip(), content.strip())
+            path = backend.add_entry(title.strip(), content.strip())
             return CommandResult(message=f"Added memory entry {path.name}")
         if action == "remove" and rest:
-            if remove_memory_entry(context.cwd, rest.strip()):
+            if backend.remove_entry(rest.strip()):
                 return CommandResult(message=f"Removed memory entry {rest.strip()}")
             return CommandResult(message=f"Memory entry not found: {rest.strip()}")
         return CommandResult(message="Usage: /memory [list|show NAME|add TITLE :: CONTENT|remove NAME]")
@@ -508,7 +530,11 @@ def create_default_command_registry(
             snapshot_path = context.session_backend.save_snapshot(
                 cwd=context.cwd,
                 model=context.app_state.get().model if context.app_state is not None else load_settings().model,
-                system_prompt=build_runtime_system_prompt(load_settings(), cwd=context.cwd),
+                system_prompt=build_runtime_system_prompt(
+                    load_settings(),
+                    cwd=context.cwd,
+                    include_project_memory=context.include_project_memory,
+                ),
                 messages=context.engine.messages,
                 usage=context.engine.total_usage,
             )
@@ -853,7 +879,13 @@ def create_default_command_registry(
             return CommandResult(message="Usage: /effort [show|low|medium|high]")
         settings.effort = value
         save_settings(settings)
-        context.engine.set_system_prompt(build_runtime_system_prompt(settings, cwd=context.cwd))
+        context.engine.set_system_prompt(
+            build_runtime_system_prompt(
+                settings,
+                cwd=context.cwd,
+                include_project_memory=context.include_project_memory,
+            )
+        )
         if context.app_state is not None:
             context.app_state.set(effort=value)
         return CommandResult(message=f"Reasoning effort set to {value}.")
@@ -870,7 +902,13 @@ def create_default_command_registry(
             return CommandResult(message="Usage: /passes [show|COUNT]")
         settings.passes = passes
         save_settings(settings)
-        context.engine.set_system_prompt(build_runtime_system_prompt(settings, cwd=context.cwd))
+        context.engine.set_system_prompt(
+            build_runtime_system_prompt(
+                settings,
+                cwd=context.cwd,
+                include_project_memory=context.include_project_memory,
+            )
+        )
         if context.app_state is not None:
             context.app_state.set(passes=passes)
         return CommandResult(message=f"Pass count set to {passes}.")
@@ -1981,6 +2019,22 @@ def _resolve_memory_entry_path(memory_dir: Path, candidate: str) -> tuple[Path |
         if slugged is not None and slugged.exists():
             return slugged, False
     return None, False
+
+
+def _memory_backend_for_context(context: CommandContext) -> MemoryCommandBackend:
+    """Return the active slash-command memory backend for this command context."""
+
+    if context.memory_backend is not None:
+        return context.memory_backend
+    cwd = context.cwd
+    return MemoryCommandBackend(
+        label="OpenHarness project memory",
+        get_memory_dir=lambda: get_project_memory_dir(cwd),
+        get_entrypoint=lambda: get_memory_entrypoint(cwd),
+        list_files=lambda: list_memory_files(cwd),
+        add_entry=lambda title, content: add_memory_entry(cwd, title, content),
+        remove_entry=lambda name: remove_memory_entry(cwd, name),
+    )
 
 
 def _resolve_memory_candidate(memory_dir: Path, candidate: str) -> tuple[Path | None, bool]:

@@ -158,7 +158,7 @@ async def test_memory_show_rejects_path_traversal(tmp_path: Path, monkeypatch):
 
     result = await command.handler(args, CommandContext(engine=_make_engine(tmp_path), cwd=str(tmp_path)))
 
-    assert result.message == "Memory entry path must stay within the project memory directory."
+    assert result.message == "Memory entry path must stay within the configured memory directory."
 
 
 @pytest.mark.asyncio

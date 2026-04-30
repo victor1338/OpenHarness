@@ -33,6 +33,7 @@ from openharness.prompts import build_runtime_system_prompt
 from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
 
 from ohmo.gateway.config import load_gateway_config
+from ohmo.memory import create_memory_command_backend
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.session_storage import OhmoSessionBackend
 from ohmo.workspace import get_plugins_dir, get_skills_dir, initialize_workspace
@@ -138,6 +139,8 @@ class OhmoSessionRuntimePool:
             restore_tool_metadata=snapshot.get("tool_metadata") if snapshot else None,
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
+            memory_backend=create_memory_command_backend(self._workspace),
+            include_project_memory=False,
         )
         if snapshot and snapshot.get("session_id"):
             bundle.session_id = str(snapshot["session_id"])
@@ -206,6 +209,8 @@ class OhmoSessionRuntimePool:
                     session_id=bundle.session_id,
                     extra_skill_dirs=bundle.extra_skill_dirs,
                     extra_plugin_roots=bundle.extra_plugin_roots,
+                    memory_backend=create_memory_command_backend(self._workspace),
+                    include_project_memory=False,
                 ),
             )
             async for update in self._stream_command_result(
@@ -508,6 +513,8 @@ class OhmoSessionRuntimePool:
             restore_tool_metadata=getattr(bundle.engine, "tool_metadata", {}) or {},
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
             extra_plugin_roots=(str(get_plugins_dir(self._workspace)),),
+            memory_backend=create_memory_command_backend(self._workspace),
+            include_project_memory=False,
         )
         refreshed.session_id = prior_session_id
         await start_runtime(refreshed)
@@ -533,6 +540,7 @@ class OhmoSessionRuntimePool:
             latest_user_prompt=latest_user_prompt,
             extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
             extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
+            include_project_memory=False,
         )
 
 
