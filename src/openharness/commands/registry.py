@@ -56,6 +56,7 @@ from openharness.tasks import get_task_manager
 from openharness.plugins.types import PluginCommandDefinition
 
 if TYPE_CHECKING:
+    from openharness.config.settings import ProviderProfile
     from openharness.state import AppStateStore
     from openharness.tools.base import ToolRegistry
 
@@ -1150,6 +1151,36 @@ def create_default_command_registry(
             return CommandResult(message="Plan mode disabled.", refresh_runtime=True)
         return CommandResult(message="Usage: /plan [on|off]")
 
+    def _dedupe_model_values(values: Iterable[str]) -> list[str]:
+        models: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            model = value.strip()
+            if not model or model in seen:
+                continue
+            models.append(model)
+            seen.add(model)
+        return models
+
+    def _seed_model_values(profile: "ProviderProfile") -> list[str]:
+        existing = _dedupe_model_values(profile.allowed_models)
+        if existing:
+            return existing
+        return _dedupe_model_values([display_model_setting(profile)])
+
+    def _format_model_status(active_profile: str, profile: "ProviderProfile") -> str:
+        lines = [
+            f"Model: {display_model_setting(profile)}",
+            f"Profile: {active_profile}",
+        ]
+        if profile.allowed_models:
+            lines.append("Available models:")
+            lines.extend(f"- {model}" for model in profile.allowed_models)
+        else:
+            lines.append("Available models: unrestricted for this profile")
+            lines.append("Use /model add MODEL to pin switchable models for the TUI selector.")
+        return "\n".join(lines)
+
     async def _model_handler(args: str, context: CommandContext) -> CommandResult:
         settings = load_settings()
         manager = AuthManager(settings)
@@ -1157,7 +1188,62 @@ def create_default_command_registry(
         _, profile = settings.resolve_profile(active_profile)
         tokens = args.split(maxsplit=1)
         if not tokens or tokens[0] == "show":
-            return CommandResult(message=f"Model: {display_model_setting(profile)}\nProfile: {active_profile}")
+            return CommandResult(message=_format_model_status(active_profile, profile))
+        if tokens[0] == "list":
+            if profile.allowed_models:
+                return CommandResult(
+                    message=(
+                        f"Switchable models for profile '{active_profile}':\n"
+                        + "\n".join(f"- {model}" for model in profile.allowed_models)
+                    )
+                )
+            return CommandResult(
+                message=(
+                    f"Profile '{active_profile}' has no pinned model list. "
+                    "Any model value is accepted. Use /model add MODEL to add one."
+                )
+            )
+        if tokens[0] == "add" and len(tokens) == 2:
+            model_name = tokens[1].strip()
+            models = _dedupe_model_values([*_seed_model_values(profile), model_name])
+            if not model_name:
+                return CommandResult(message="Usage: /model add MODEL")
+            manager.update_profile(active_profile, allowed_models=models)
+            return CommandResult(
+                message=f"Added model '{model_name}' to profile '{active_profile}'.",
+                refresh_runtime=True,
+            )
+        if tokens[0] == "add":
+            return CommandResult(message="Usage: /model add MODEL")
+        if tokens[0] in {"remove", "rm"} and len(tokens) == 2:
+            model_name = tokens[1].strip()
+            models = [model for model in _dedupe_model_values(profile.allowed_models) if model != model_name]
+            if len(models) == len(_dedupe_model_values(profile.allowed_models)):
+                return CommandResult(message=f"Model '{model_name}' is not pinned for profile '{active_profile}'.")
+            reset_current = (profile.last_model or "").strip() == model_name
+            manager.update_profile(
+                active_profile,
+                allowed_models=models,
+                last_model="" if reset_current else None,
+            )
+            updated = load_settings()
+            if reset_current:
+                context.engine.set_model(updated.model)
+                if context.app_state is not None:
+                    updated_profile = updated.resolve_profile()[1]
+                    context.app_state.set(model=display_model_setting(updated_profile))
+            return CommandResult(
+                message=f"Removed model '{model_name}' from profile '{active_profile}'.",
+                refresh_runtime=True,
+            )
+        if tokens[0] in {"remove", "rm"}:
+            return CommandResult(message="Usage: /model remove MODEL")
+        if tokens[0] == "clear":
+            manager.update_profile(active_profile, allowed_models=[])
+            return CommandResult(
+                message=f"Cleared pinned models for profile '{active_profile}'. Any model value is now accepted.",
+                refresh_runtime=True,
+            )
         if tokens[0] == "set" and len(tokens) == 2:
             model_name = tokens[1].strip()
         elif args.strip():
@@ -1180,7 +1266,7 @@ def create_default_command_registry(
                 updated_profile = updated.resolve_profile()[1]
                 context.app_state.set(model=display_model_setting(updated_profile))
             return CommandResult(message=message, refresh_runtime=True)
-        return CommandResult(message="Usage: /model [show|MODEL]")
+        return CommandResult(message="Usage: /model [show|list|add MODEL|remove MODEL|clear|MODEL]")
 
     async def _provider_handler(args: str, context: CommandContext) -> CommandResult:
         manager = AuthManager()
@@ -1943,7 +2029,7 @@ def create_default_command_registry(
     registry.register(SlashCommand("turns", "Show or update maximum agentic turn count", _turns_handler))
     registry.register(SlashCommand("continue", "Continue the previous tool loop if it was interrupted", _continue_handler))
     registry.register(SlashCommand("provider", "Show or switch provider profiles", _provider_handler))
-    registry.register(SlashCommand("model", "Show or update the default model", _model_handler))
+    registry.register(SlashCommand("model", "Show, switch, or manage profile models", _model_handler))
     registry.register(SlashCommand("theme", "List, set, show or preview TUI themes", _theme_handler))
     registry.register(SlashCommand("output-style", "Show or update output style", _output_style_handler))
     registry.register(SlashCommand("keybindings", "Show resolved keybindings", _keybindings_handler))
