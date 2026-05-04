@@ -252,9 +252,14 @@ def _is_prompt_too_long_error(exc: Exception) -> bool:
         needle in text
         for needle in (
             "prompt too long",
+            "context_length_exceeded",
             "context length",
             "maximum context",
             "context window",
+            "input tokens exceed",
+            "messages resulted in",
+            "reduce the length of the messages",
+            "configured limit",
             "too many tokens",
             "too large for the model",
             "maximum context length",

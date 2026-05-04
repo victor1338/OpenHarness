@@ -179,8 +179,13 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 		const isPaste = chunk.length > 1 && !key.ctrl && !key.meta;
 		const isEscape = key.escape || chunk === '\u001B';
 
-		// Ctrl+C → exit
+		// Ctrl+C interrupts a running turn; when idle it exits the TUI.
 		if (key.ctrl && chunk === 'c') {
+			if (session.busy) {
+				session.sendRequest({type: 'interrupt'});
+				session.setBusyLabel('Stopping current operation...');
+				return;
+			}
 			session.sendRequest({type: 'shutdown'});
 			exit();
 			return;
@@ -281,6 +286,13 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			return;
 		}
 
+		// Empty-input Tab opens the permission mode picker. This makes leaving
+		// plan mode explicit without requiring users to remember /permissions.
+		if (!showPicker && key.tab && input.trim() === '') {
+			session.sendRequest({type: 'select_command', command: 'permissions'});
+			return;
+		}
+
 		// --- Command picker ---
 		if (showPicker) {
 			if (key.upArrow) {
@@ -362,6 +374,11 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			return;
 		}
 		if (!value.trim() || session.busy || !session.ready) {
+			if (session.busy && value.trim() === '/stop') {
+				session.sendRequest({type: 'interrupt'});
+				session.setBusyLabel('Stopping current operation...');
+				setInput('');
+			}
 			return;
 		}
 		// Check if it's an interactive command
@@ -469,9 +486,10 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 						<Text color={theme.colors.primary}>shift+enter</Text> newline{'  '}
 						<Text color={theme.colors.primary}>enter</Text> send{'  '}
 						<Text color={theme.colors.primary}>/</Text> commands{'  '}
+						<Text color={theme.colors.primary}>tab</Text> mode{'  '}
 						<Text color={theme.colors.primary}>{'\u2191\u2193'}</Text> history{'  '}
-						<Text color={theme.colors.primary}>esc</Text> stop{'  '}
-						<Text color={theme.colors.primary}>ctrl+c</Text> exit
+						<Text color={theme.colors.primary}>{session.busy ? '/stop' : 'esc'}</Text> stop{'  '}
+						<Text color={theme.colors.primary}>ctrl+c</Text> {session.busy ? 'stop' : 'exit'}
 					</Text>
 				</Box>
 			) : null}

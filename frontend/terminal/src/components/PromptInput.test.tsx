@@ -74,19 +74,27 @@ async function waitForValue(getValue: () => string, expected: string): Promise<v
 	assert.equal(getValue(), expected);
 }
 
-function PromptHarness({onInputChange}: {onInputChange: (value: string) => void}): React.JSX.Element {
+function PromptHarness({
+	busy = false,
+	onInputChange,
+	onSubmit = () => undefined,
+}: {
+	busy?: boolean;
+	onInputChange: (value: string) => void;
+	onSubmit?: (value: string) => void;
+}): React.JSX.Element {
 	const [input, setInput] = useState('');
 
 	return (
 		<ThemeProvider initialTheme="default">
 			<PromptInput
-				busy={false}
+				busy={busy}
 				input={input}
 				setInput={(value) => {
 					onInputChange(value);
 					setInput(value);
 				}}
-				onSubmit={() => undefined}
+				onSubmit={onSubmit}
 			/>
 		</ThemeProvider>
 	);
@@ -156,6 +164,43 @@ test('keeps forward delete behavior when cursor is inside the line', async () =>
 
 		await sendKey(stdin, '\u001B[3~');
 		await waitForValue(() => currentValue, 'a');
+	} finally {
+		instance.unmount();
+		await exitPromise;
+		instance.cleanup();
+		stdin.destroy();
+		stdout.destroy();
+	}
+});
+
+test('accepts explicit /stop submission while busy', async () => {
+	const stdin = createTestStdin();
+	const stdout = createTestStdout();
+	let currentValue = '';
+	let submitted = '';
+
+	const instance = render(<PromptHarness busy onInputChange={(value) => {
+		currentValue = value;
+	}} onSubmit={(value) => {
+		submitted = value;
+	}} />, {
+		stdin: stdin as unknown as NodeJS.ReadStream & {fd: 0},
+		stdout: stdout as unknown as NodeJS.WriteStream,
+		debug: true,
+		patchConsole: false,
+	});
+	const exitPromise = instance.waitUntilExit();
+
+	try {
+		await nextLoopTurn();
+
+		for (const char of '/stop') {
+			await sendKey(stdin, char);
+		}
+		await waitForValue(() => currentValue, '/stop');
+
+		await sendKey(stdin, '\r');
+		await waitForValue(() => submitted, '/stop');
 	} finally {
 		instance.unmount();
 		await exitPromise;

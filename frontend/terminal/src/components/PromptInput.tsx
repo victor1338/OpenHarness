@@ -221,8 +221,8 @@ export function PromptInput({
 			<MultilineTextInput
 				value={input}
 				onChange={setInput}
-				onSubmit={suppressSubmit || busy ? noop : onSubmit}
-				focus={!busy}
+				onSubmit={suppressSubmit ? noop : onSubmit}
+				focus
 				promptPrefix={promptPrefix}
 				promptColor={theme.colors.primary}
 			/>
