@@ -7,6 +7,7 @@ from openharness.commands.registry import (
     MemoryCommandBackend,
     SlashCommand,
     create_default_command_registry,
+    lookup_skill_slash_command,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "MemoryCommandBackend",
     "SlashCommand",
     "create_default_command_registry",
+    "lookup_skill_slash_command",
 ]

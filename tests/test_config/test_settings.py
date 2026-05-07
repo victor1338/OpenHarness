@@ -595,6 +595,70 @@ class TestMiniMaxProvider:
         assert materialized.api_format == "openai"
 
 
+class TestNvidiaProvider:
+    """Tests for NVIDIA NIM provider profile and auth integration."""
+
+    def test_nvidia_in_default_provider_profiles(self):
+        from openharness.config.settings import default_provider_profiles
+
+        profiles = default_provider_profiles()
+        assert "nvidia" in profiles
+        profile = profiles["nvidia"]
+        assert profile.provider == "nvidia"
+        assert profile.api_format == "openai"
+        assert profile.auth_source == "nvidia_api_key"
+        assert profile.default_model == "openai/gpt-oss-120b"
+        assert profile.base_url == "https://integrate.api.nvidia.com/v1"
+
+    def test_auth_source_provider_name_nvidia(self):
+        from openharness.config.settings import auth_source_provider_name
+
+        assert auth_source_provider_name("nvidia_api_key") == "nvidia"
+
+    def test_default_auth_source_for_nvidia_provider(self):
+        from openharness.config.settings import default_auth_source_for_provider
+
+        assert default_auth_source_for_provider("nvidia") == "nvidia_api_key"
+
+    def test_resolve_auth_reads_nvidia_api_key_env(self, monkeypatch):
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-test-key")
+        settings = Settings(
+            active_profile="nvidia",
+            profiles={
+                "nvidia": ProviderProfile(
+                    label="NVIDIA NIM",
+                    provider="nvidia",
+                    api_format="openai",
+                    auth_source="nvidia_api_key",
+                    default_model="openai/gpt-oss-120b",
+                    base_url="https://integrate.api.nvidia.com/v1",
+                )
+            },
+        )
+        resolved = settings.resolve_auth()
+        assert resolved.value == "nvidia-test-key"
+        assert "NVIDIA_API_KEY" in resolved.source
+
+    def test_nvidia_profile_materializes_default_model(self):
+        settings = Settings(
+            active_profile="nvidia",
+            profiles={
+                "nvidia": ProviderProfile(
+                    label="NVIDIA NIM",
+                    provider="nvidia",
+                    api_format="openai",
+                    auth_source="nvidia_api_key",
+                    default_model="openai/gpt-oss-120b",
+                    base_url="https://integrate.api.nvidia.com/v1",
+                )
+            },
+        )
+        materialized = settings.materialize_active_profile()
+        assert materialized.model == "openai/gpt-oss-120b"
+        assert materialized.provider == "nvidia"
+        assert materialized.api_format == "openai"
+
+
 class TestQwenProvider:
     """Tests for Qwen (DashScope) provider profile and auth integration."""
 

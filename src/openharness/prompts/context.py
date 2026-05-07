@@ -33,7 +33,7 @@ def _build_skills_section(
         extra_plugin_roots=extra_plugin_roots,
         settings=settings,
     )
-    skills = registry.list_skills()
+    skills = [skill for skill in registry.list_skills() if not skill.disable_model_invocation]
     if not skills:
         return None
     lines = [
@@ -41,11 +41,14 @@ def _build_skills_section(
         "",
         "The following skills are available via the `skill` tool. "
         "When a user's request matches a skill, invoke it with `skill(name=\"<skill_name>\")` "
-        "to load detailed instructions before proceeding.",
+        "to load detailed instructions before proceeding. "
+        "User-invocable skills can also be run directly by the user as `/<skill-name>`.",
         "",
     ]
     for skill in skills:
-        lines.append(f"- **{skill.name}**: {skill.description}")
+        command_name = skill.command_name or skill.name
+        display = f" ({skill.display_name})" if skill.display_name else ""
+        lines.append(f"- **{command_name}**{display}: {skill.description}")
     return "\n".join(lines)
 
 

@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import shlex
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -62,12 +61,34 @@ class BackgroundTaskManager:
     async def create_shell_task(
         self,
         *,
-        command: str,
+        command: str | None = None,
         description: str,
         cwd: str | Path,
         task_type: TaskType = "local_bash",
+        env: dict[str, str] | None = None,
+        argv: list[str] | None = None,
     ) -> TaskRecord:
-        """Start a background shell command."""
+        """Start a background command.
+
+        Either ``command`` (a shell-evaluated string) or ``argv`` (a direct
+        argv list) must be supplied. The ``argv`` form bypasses shell
+        invocation entirely — it spawns the executable directly via
+        ``asyncio.create_subprocess_exec(*argv)`` — which is the right choice
+        for teammate spawning on Windows: Git Bash cannot reliably exec
+        Windows-pathed binaries (e.g. ``C:\\Users\\...\\python.exe``) when it
+        is itself launched via ``create_subprocess_exec`` with that path
+        embedded in a ``-lc`` string, even though the same shell call works
+        interactively. Bypassing the shell sidesteps that entire class of
+        platform-quoting bug.
+
+        ``env`` is merged with ``os.environ`` when the subprocess is launched,
+        so callers should pass only the variables they want to add or
+        override.
+        """
+        if command is None and argv is None:
+            raise ValueError("create_shell_task requires either command or argv")
+        if command is not None and argv is not None:
+            raise ValueError("create_shell_task accepts only one of command or argv")
         task_id = _task_id(task_type)
         output_path = get_tasks_dir() / f"{task_id}.log"
         record = TaskRecord(
@@ -80,6 +101,8 @@ class BackgroundTaskManager:
             command=command,
             created_at=time.time(),
             started_at=time.time(),
+            env=dict(env) if env is not None else None,
+            argv=list(argv) if argv is not None else None,
         )
         output_path.write_text("", encoding="utf-8")
         self._tasks[task_id] = record
@@ -98,24 +121,34 @@ class BackgroundTaskManager:
         model: str | None = None,
         api_key: str | None = None,
         command: str | None = None,
+        env: dict[str, str] | None = None,
+        argv: list[str] | None = None,
     ) -> TaskRecord:
-        """Start a local agent task as a subprocess."""
-        if command is None:
+        """Start a local agent task as a subprocess.
+
+        Prefer ``argv`` (direct exec, no shell) over ``command`` (shell-
+        evaluated) for teammate spawn — see :meth:`create_shell_task` for
+        the cross-platform reasoning. ``env`` is forwarded to
+        :meth:`create_shell_task` and ultimately merged with ``os.environ``
+        at process spawn time.
+        """
+        if command is None and argv is None:
             effective_api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
             if not effective_api_key:
                 raise ValueError(
-                    "Local agent tasks require ANTHROPIC_API_KEY or an explicit command override"
+                    "Local agent tasks require ANTHROPIC_API_KEY or an explicit command/argv override"
                 )
-            cmd = ["python", "-m", "openharness", "--api-key", effective_api_key]
+            argv = ["python", "-m", "openharness", "--api-key", effective_api_key]
             if model:
-                cmd.extend(["--model", model])
-            command = " ".join(shlex.quote(part) for part in cmd)
+                argv.extend(["--model", model])
 
         record = await self.create_shell_task(
             command=command,
             description=description,
             cwd=cwd,
             task_type=task_type,
+            env=env,
+            argv=argv,
         )
         updated = replace(record, prompt=prompt)
         if task_type != "local_agent":
@@ -255,18 +288,43 @@ class BackgroundTaskManager:
 
     async def _start_process(self, task_id: str) -> asyncio.subprocess.Process:
         task = self._require_task(task_id)
-        if task.command is None:
-            raise ValueError(f"Task {task_id} does not have a command to run")
+        if task.command is None and task.argv is None:
+            raise ValueError(f"Task {task_id} does not have a command or argv to run")
 
         generation = self._generations.get(task_id, 0) + 1
         self._generations[task_id] = generation
-        process = await create_shell_subprocess(
-            task.command,
-            cwd=task.cwd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        # Merge task-specific env vars on top of the parent process environment
+        # so the child sees both. Passing ``None`` lets the OS inherit env
+        # directly, which is the legacy behaviour for plain shell tasks.
+        merged_env: dict[str, str] | None
+        if task.env:
+            merged_env = {**os.environ, **task.env}
+        else:
+            merged_env = None
+
+        if task.argv is not None:
+            # Direct-exec route. No shell. Used for teammate spawn so we
+            # don't have to round-trip Windows paths through Git Bash, which
+            # cannot reliably exec ``C:\\...\\python.exe`` when launched
+            # itself via ``asyncio.create_subprocess_exec`` (see #230).
+            process = await asyncio.create_subprocess_exec(
+                *task.argv,
+                cwd=str(Path(task.cwd).resolve()),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=merged_env,
+            )
+        else:
+            assert task.command is not None
+            process = await create_shell_subprocess(
+                task.command,
+                cwd=task.cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=merged_env,
+            )
         self._processes[task_id] = process
         self._waiters[task_id] = asyncio.create_task(
             self._watch_process(task_id, process, generation)
@@ -285,8 +343,8 @@ class BackgroundTaskManager:
         return await self._restart_agent_task(task)
 
     async def _restart_agent_task(self, task: TaskRecord) -> asyncio.subprocess.Process:
-        if task.command is None:
-            raise ValueError(f"Task {task.id} does not have a restart command")
+        if task.command is None and task.argv is None:
+            raise ValueError(f"Task {task.id} does not have a restart command or argv")
 
         waiter = self._waiters.get(task.id)
         if waiter is not None and not waiter.done():

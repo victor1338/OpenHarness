@@ -27,7 +27,7 @@ from openharness.coordinator.agent_definitions import (
 )
 from openharness.plugins.schemas import PluginManifest
 from openharness.plugins.types import LoadedPlugin, PluginCommandDefinition
-from openharness.skills.loader import _parse_skill_markdown
+from openharness.skills.loader import _parse_skill_metadata
 from openharness.skills.types import SkillDefinition
 
 logger = logging.getLogger(__name__)
@@ -256,7 +256,10 @@ def _load_plugin_skills(path: Path) -> list[SkillDefinition]:
     direct_skill = path / "SKILL.md"
     if direct_skill.exists():
         content = direct_skill.read_text(encoding="utf-8")
-        name, description = _parse_skill_markdown(path.name, content)
+        metadata = _parse_skill_metadata(path.name, content)
+        name = metadata["name"]
+        description = metadata["description"]
+        display_name = name if name != path.name else None
         skills.append(
             SkillDefinition(
                 name=name,
@@ -264,6 +267,13 @@ def _load_plugin_skills(path: Path) -> list[SkillDefinition]:
                 content=content,
                 source="plugin",
                 path=str(direct_skill),
+                base_dir=str(path),
+                command_name=path.name,
+                display_name=display_name,
+                user_invocable=metadata["user_invocable"],
+                disable_model_invocation=metadata["disable_model_invocation"],
+                model=metadata["model"],
+                argument_hint=metadata["argument_hint"],
             )
         )
         return skills
@@ -274,7 +284,10 @@ def _load_plugin_skills(path: Path) -> list[SkillDefinition]:
         if not skill_path.exists():
             continue
         content = skill_path.read_text(encoding="utf-8")
-        name, description = _parse_skill_markdown(child.name, content)
+        metadata = _parse_skill_metadata(child.name, content)
+        name = metadata["name"]
+        description = metadata["description"]
+        display_name = name if name != child.name else None
         skills.append(
             SkillDefinition(
                 name=name,
@@ -282,6 +295,13 @@ def _load_plugin_skills(path: Path) -> list[SkillDefinition]:
                 content=content,
                 source="plugin",
                 path=str(skill_path),
+                base_dir=str(child),
+                command_name=child.name,
+                display_name=display_name,
+                user_invocable=metadata["user_invocable"],
+                disable_model_invocation=metadata["disable_model_invocation"],
+                model=metadata["model"],
+                argument_hint=metadata["argument_hint"],
             )
         )
     return skills

@@ -58,23 +58,31 @@ class SubprocessBackend:
             system_prompt_mode=config.system_prompt_mode,
             plan_mode_required=config.plan_mode_required,
         )
-        extra_env = build_inherited_env_vars()
-
-        command = config.command
+        # Only inject the inherited teammate env vars when we are also
+        # building the command ourselves. If the caller supplied a custom
+        # ``config.command`` we honour their choice and don't second-guess
+        # which env vars they want, matching pre-fix behaviour.
+        extra_env: dict[str, str] | None = None
+        argv: list[str] | None = None
+        command: str | None = config.command
         if command is None:
-            # Build environment export prefix for shell invocation
-            env_prefix = " ".join(f"{k}={v!r}" for k, v in extra_env.items())
-
+            # Direct-exec argv list — no shell, no quoting required. This
+            # avoids Git Bash on Windows being unable to exec a Windows-
+            # pathed python interpreter when bash is itself launched via
+            # ``asyncio.create_subprocess_exec`` (see issue #230).
+            extra_env = build_inherited_env_vars()
             teammate_cmd = get_teammate_command()
             if (
                 teammate_cmd.endswith("python")
                 or teammate_cmd.endswith("python3")
+                or teammate_cmd.endswith("python.exe")
+                or teammate_cmd.endswith("python3.exe")
                 or "/python" in teammate_cmd
+                or "\\python" in teammate_cmd.lower()
             ):
-                cmd_parts = [teammate_cmd, "-m", "openharness", "--task-worker"] + flags
+                argv = [teammate_cmd, "-m", "openharness", "--task-worker"] + flags
             else:
-                cmd_parts = [teammate_cmd, "--task-worker"] + flags
-            command = f"{env_prefix} {' '.join(cmd_parts)}" if env_prefix else " ".join(cmd_parts)
+                argv = [teammate_cmd, "--task-worker"] + flags
 
         manager = get_task_manager()
         try:
@@ -85,6 +93,8 @@ class SubprocessBackend:
                 task_type=config.task_type,
                 model=config.model,
                 command=command,
+                argv=argv,
+                env=extra_env,
             )
         except Exception as exc:
             logger.error("Failed to spawn teammate %s: %s", agent_id, exc)

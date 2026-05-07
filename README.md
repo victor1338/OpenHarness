@@ -302,7 +302,7 @@ oh setup    # interactive wizard — pick a provider, authenticate, done
 # On Windows PowerShell, use: openh setup
 ```
 
-Supports **Claude / OpenAI / Copilot / Codex / Moonshot(Kimi) / GLM / MiniMax** and any compatible endpoint.
+Supports **Claude / OpenAI / Copilot / Codex / Moonshot(Kimi) / GLM / MiniMax / NVIDIA NIM** and any compatible endpoint.
 
 ### 3. Run
 
@@ -422,6 +422,7 @@ Any provider implementing the OpenAI `/v1/chat/completions` style API works:
 | **DeepSeek** | `https://api.deepseek.com` | `deepseek-chat`, `deepseek-reasoner` |
 | **GitHub Models** | `https://models.inference.ai.azure.com` | `gpt-4o`, `Meta-Llama-3.1-405B-Instruct` |
 | **SiliconFlow** | `https://api.siliconflow.cn/v1` | `deepseek-ai/DeepSeek-V3` |
+| **NVIDIA NIM** | `https://integrate.api.nvidia.com/v1` | `openai/gpt-oss-120b`, `nvidia/llama-3.3-nemotron-super-49b-v1` |
 | **Google Gemini** | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.5-flash`, `gemini-2.5-pro` |
 | **Groq** | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
 | **Ollama (local)** | `http://localhost:11434/v1` | any local model |
@@ -870,6 +871,16 @@ Useful contributor entry points:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, checks, and PR expectations
 - [`CHANGELOG.md`](CHANGELOG.md) for user-visible changes
 - [`docs/SHOWCASE.md`](docs/SHOWCASE.md) for real-world usage patterns worth documenting
+
+---
+
+## 🔧 Troubleshooting
+
+### Backspace key in macOS Terminal.app
+
+OpenHarness handles both common terminal delete sequences, including the raw `DEL` byte (`0x7f`) that macOS Terminal.app sends for Backspace. If Backspace inserts spaces or visible control characters instead of deleting text, upgrade OpenHarness first.
+
+For older versions that do not include this fix, use a terminal that sends a standard Backspace sequence or adjust your terminal keyboard profile as a temporary workaround.
 
 ---
 

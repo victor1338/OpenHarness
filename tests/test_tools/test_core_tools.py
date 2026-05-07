@@ -158,6 +158,31 @@ async def test_skill_todo_and_config_tools(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_skill_tool_rejects_user_only_skills(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    skills_dir = tmp_path / "config" / "skills"
+    skills_dir.mkdir(parents=True)
+    deploy_dir = skills_dir / "deploy"
+    deploy_dir.mkdir()
+    (deploy_dir / "SKILL.md").write_text(
+        "---\n"
+        "description: User-only deploy workflow.\n"
+        "disable-model-invocation: true\n"
+        "---\n\n"
+        "# Deploy\n",
+        encoding="utf-8",
+    )
+
+    result = await SkillTool().execute(
+        SkillToolInput(name="deploy"),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is True
+    assert "can only be invoked by the user as /deploy" in result.output
+
+
+@pytest.mark.asyncio
 async def test_todo_write_upsert(tmp_path: Path):
     tool = TodoWriteTool()
     ctx = ToolExecutionContext(cwd=tmp_path)

@@ -121,6 +121,9 @@ def test_ohmo_init_interactive_writes_feishu_gateway_config(tmp_path: Path, monk
             "enc_key",   # encrypt_key
             "verify_me", # verification_token
             "OK",        # react_emoji
+            "1",         # group_policy -> managed_or_mention
+            "ohmo,openclaw", # bot_names
+            "",          # bot_open_id
             "y",         # send_progress
             "n",         # send_tool_hints
             "n",         # allow_remote_admin_commands
@@ -135,6 +138,8 @@ def test_ohmo_init_interactive_writes_feishu_gateway_config(tmp_path: Path, monk
     assert config["channel_configs"]["feishu"]["encrypt_key"] == "enc_key"
     assert config["channel_configs"]["feishu"]["verification_token"] == "verify_me"
     assert config["channel_configs"]["feishu"]["react_emoji"] == "OK"
+    assert config["channel_configs"]["feishu"]["group_policy"] == "managed_or_mention"
+    assert config["channel_configs"]["feishu"]["bot_names"] == ["ohmo", "openclaw"]
 
 
 def test_ohmo_config_interactive_can_restart_gateway(tmp_path: Path, monkeypatch):
@@ -159,6 +164,9 @@ def test_ohmo_config_interactive_can_restart_gateway(tmp_path: Path, monkeypatch
             "",           # encrypt_key
             "verify_me",  # verification_token
             "OK",         # react_emoji
+            "1",          # group_policy -> managed_or_mention
+            "ohmo,openclaw", # bot_names
+            "",           # bot_open_id
             "y",          # send_progress
             "y",          # send_tool_hints
             "n",          # allow_remote_admin_commands

@@ -151,7 +151,7 @@ class QueryEngine:
             if isinstance(prompt, ConversationMessage)
             else ConversationMessage.from_user_text(prompt)
         )
-        if user_message.text.strip():
+        if user_message.text.strip() and not self._tool_metadata.pop("_suppress_next_user_goal", False):
             remember_user_goal(self._tool_metadata, user_message.text)
         self._messages.append(user_message)
         if self._hook_executor is not None:

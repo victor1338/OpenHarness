@@ -52,10 +52,13 @@ class OhmoGatewayService:
                 ",".join(self._config.allowed_remote_admin_commands),
             )
         self._bus = MessageBus()
+        self._manager = ChannelManager(build_channel_manager_config(self._config), self._bus)
         self._runtime_pool = OhmoSessionRuntimePool(
             cwd=self._cwd,
             workspace=self._workspace,
             provider_profile=self._config.provider_profile,
+            create_feishu_group=self.create_group_for_user,
+            publish_group_welcome=self.publish_group_welcome,
         )
         self._stop_event: asyncio.Event | None = None
         self._restart_requested = False
@@ -63,8 +66,11 @@ class OhmoGatewayService:
             bus=self._bus,
             runtime_pool=self._runtime_pool,
             restart_gateway=self.request_restart,
+            workspace=root,
+            feishu_group_policy=str(
+                self._config.channel_configs.get("feishu", {}).get("group_policy", "managed_or_mention")
+            ),
         )
-        self._manager = ChannelManager(build_channel_manager_config(self._config), self._bus)
 
     @property
     def pid_file(self) -> Path:
@@ -107,6 +113,34 @@ class OhmoGatewayService:
         await asyncio.sleep(0.75)
         if self._stop_event is not None:
             self._stop_event.set()
+
+    async def create_group(self, message, name: str) -> str:
+        """Create a managed group through the active channel implementation."""
+        if message.channel != "feishu":
+            raise RuntimeError(f"{message.channel} does not support managed group creation.")
+        return await self.create_group_for_user(str(message.sender_id), name)
+
+    async def create_group_for_user(self, user_open_id: str, name: str) -> str:
+        """Create a managed Feishu group for a user open_id."""
+        channel = self._manager.get_channel("feishu")
+        if channel is None:
+            raise RuntimeError("Feishu channel is not enabled.")
+        creator = getattr(channel, "create_managed_group", None)
+        if creator is None:
+            raise RuntimeError("Feishu channel does not support managed group creation.")
+        result = creator(user_open_id=str(user_open_id), name=name)
+        return str(await result if asyncio.iscoroutine(result) else result)
+
+    async def publish_group_welcome(self, chat_id: str, content: str, owner_open_id: str) -> None:
+        """Send a welcome message to a newly created managed group."""
+        await self._bus.publish_outbound(
+            OutboundMessage(
+                channel="feishu",
+                chat_id=chat_id,
+                content=content,
+                metadata={"chat_type": "group", "_session_key": f"feishu:{chat_id}:{owner_open_id}"},
+            )
+        )
 
     def _exec_restart(self) -> None:
         root = str(get_workspace_root(self._workspace))

@@ -712,7 +712,9 @@ async def run_query(
         # --- auto-compact check before calling the model ---------------
         async for event, usage in _stream_compaction(trigger="auto"):
             yield event, usage
-        messages, was_compacted = last_compaction_result
+        compacted_messages, was_compacted = last_compaction_result
+        if compacted_messages is not messages:
+            messages[:] = compacted_messages
         # ---------------------------------------------------------------
 
         # --- image preprocessing: convert ImageBlocks to text for non-vision models ---
@@ -771,7 +773,9 @@ async def run_query(
                 yield StatusEvent(message=REACTIVE_COMPACT_STATUS_MESSAGE), None
                 async for event, usage in _stream_compaction(trigger="reactive", force=True):
                     yield event, usage
-                messages, was_compacted = last_compaction_result
+                compacted_messages, was_compacted = last_compaction_result
+                if compacted_messages is not messages:
+                    messages[:] = compacted_messages
                 if was_compacted:
                     continue
             if "connect" in error_msg.lower() or "timeout" in error_msg.lower() or "network" in error_msg.lower():
