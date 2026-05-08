@@ -6,6 +6,18 @@ The format is based on Keep a Changelog, and this project currently tracks chang
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-05-07
+
+### Added
+
+- Added a bundled `skill-creator` skill for creating, improving, and verifying OpenHarness/ohmo skills.
+- User-invocable skills can now be triggered directly as slash commands, with support for skill-specific arguments and model override metadata.
+
+### Fixed
+
+- `oh setup` can now update the API key for an already-configured API-key provider profile instead of only changing the model.
+- `oh provider edit <profile> --api-key <key>` can now replace a saved profile API key, and `oh provider add ... --api-key <key>` can store one during profile creation.
+
 ## [0.1.8] - 2026-05-06
 
 ### Added

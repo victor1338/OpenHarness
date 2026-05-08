@@ -616,7 +616,31 @@ Available Skills:
 - ... 40+ more
 ```
 
-**Compatible with [anthropics/skills](https://github.com/anthropics/skills)** — just copy `.md` files to `~/.openharness/skills/`.
+Skills can live in bundled, user, ohmo, project, or plugin locations. User-level skills are loaded from:
+
+```text
+~/.openharness/skills/<skill>/SKILL.md
+~/.claude/skills/<skill>/SKILL.md
+~/.agents/skills/<skill>/SKILL.md
+```
+
+Project-level skills are enabled by default and are discovered from the current working directory up to the git root:
+
+```text
+<project>/.openharness/skills/<skill>/SKILL.md
+<project>/.agents/skills/<skill>/SKILL.md
+<project>/.claude/skills/<skill>/SKILL.md
+```
+
+Disable project skills for untrusted repositories with:
+
+```bash
+oh config set allow_project_skills false
+```
+
+Use `/skills` to list loaded skills with their source and path. User-invocable skills can be run directly as slash commands, for example `/deploy staging`.
+
+**Compatible with [anthropics/skills](https://github.com/anthropics/skills)** — use the `SKILL.md` directory layout above.
 
 ### 🔌 Plugin System
 

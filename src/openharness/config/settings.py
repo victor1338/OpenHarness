@@ -518,6 +518,10 @@ class Settings(BaseModel):
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     enabled_plugins: dict[str, bool] = Field(default_factory=dict)
     allow_project_plugins: bool = False
+    allow_project_skills: bool = True
+    project_skill_dirs: list[str] = Field(
+        default_factory=lambda: [".openharness/skills", ".agents/skills", ".claude/skills"]
+    )
     mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict)
 
     # UI

@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import typer
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 _PREVIEW_STOPWORDS = {
     "a",
@@ -1309,6 +1309,18 @@ def _secret_prompt(message: str) -> str:
     return typer.prompt(message, hide_input=True)
 
 
+def _confirm_prompt(message: str, *, default: bool = False) -> bool:
+    """Prompt for a yes/no confirmation, preferring questionary in a real TTY."""
+    if _can_use_questionary():
+        import questionary
+
+        result = questionary.confirm(message, default=default).ask()
+        if result is None:
+            raise typer.Abort()
+        return bool(result)
+    return bool(typer.confirm(message, default=default))
+
+
 def _select_from_menu(
     title: str,
     options: list[tuple[str, str]],
@@ -1613,6 +1625,19 @@ def _ensure_profile_auth(manager, profile_name: str) -> None:
     print(f"{profile.label} API key saved.", flush=True)
 
 
+def _maybe_update_profile_auth(manager, profile_name: str) -> bool:
+    """Ask whether to replace an already configured profile API key."""
+    from openharness.config.settings import auth_source_uses_api_key
+
+    profile = manager.list_profiles()[profile_name]
+    if not auth_source_uses_api_key(profile.auth_source):
+        return False
+    if not _confirm_prompt(f"Update API key for {profile.label}?", default=False):
+        return False
+    _ensure_profile_auth(manager, profile_name)
+    return True
+
+
 def _maybe_update_default_model_for_provider(provider: str) -> None:
     """Keep the active model in-family after switching auth providers."""
     from openharness.auth.manager import AuthManager
@@ -1743,6 +1768,9 @@ def setup_cmd(
         print(f"{info['label']} requires {source_label}.", flush=True)
         _ensure_profile_auth(manager, target)
         manager = AuthManager()
+    else:
+        if _maybe_update_profile_auth(manager, target):
+            manager = AuthManager()
 
     profile_obj = manager.list_profiles()[target]
     model_setting = _prompt_model_for_profile(profile_obj)
@@ -1968,6 +1996,7 @@ def provider_add(
     model: str = typer.Option(..., "--model", help="Default model"),
     base_url: str | None = typer.Option(None, "--base-url", help="Optional base URL"),
     credential_slot: str | None = typer.Option(None, "--credential-slot", help="Optional profile-specific credential slot"),
+    api_key: str | None = typer.Option(None, "--api-key", help="Set the profile API key"),
     allowed_models: list[str] | None = typer.Option(None, "--allowed-model", help="Allowed model values for this profile"),
     context_window_tokens: int | None = typer.Option(None, "--context-window-tokens", help="Optional context window override for auto-compact"),
     auto_compact_threshold_tokens: int | None = typer.Option(None, "--auto-compact-threshold-tokens", help="Optional explicit auto-compact threshold override"),
@@ -1993,7 +2022,12 @@ def provider_add(
             auto_compact_threshold_tokens=auto_compact_threshold_tokens,
         ),
     )
-    print(f"Saved provider profile: {name}", flush=True)
+    if api_key is not None:
+        manager = AuthManager()
+        manager.store_profile_credential(name, "api_key", api_key)
+        print(f"Saved provider profile: {name} (API key set)", flush=True)
+    else:
+        print(f"Saved provider profile: {name}", flush=True)
 
 
 @provider_app.command("edit")
@@ -2006,6 +2040,7 @@ def provider_edit(
     model: str | None = typer.Option(None, "--model", help="Default model"),
     base_url: str | None = typer.Option(None, "--base-url", help="Optional base URL"),
     credential_slot: str | None = typer.Option(None, "--credential-slot", help="Optional profile-specific credential slot"),
+    api_key: str | None = typer.Option(None, "--api-key", help="Replace the profile API key"),
     allowed_models: list[str] | None = typer.Option(None, "--allowed-model", help="Allowed model values for this profile"),
     context_window_tokens: int | None = typer.Option(None, "--context-window-tokens", help="Optional context window override for auto-compact"),
     auto_compact_threshold_tokens: int | None = typer.Option(None, "--auto-compact-threshold-tokens", help="Optional explicit auto-compact threshold override"),
@@ -2029,10 +2064,16 @@ def provider_edit(
             context_window_tokens=context_window_tokens,
             auto_compact_threshold_tokens=auto_compact_threshold_tokens,
         )
+        if api_key is not None:
+            manager = AuthManager()
+            manager.store_profile_credential(name, "api_key", api_key)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise typer.Exit(1)
-    print(f"Updated provider profile: {name}", flush=True)
+    if api_key is not None:
+        print(f"Updated provider profile: {name} (API key replaced)", flush=True)
+    else:
+        print(f"Updated provider profile: {name}", flush=True)
 
 
 @provider_app.command("remove")

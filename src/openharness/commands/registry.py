@@ -914,10 +914,11 @@ def create_default_command_registry(
         lines = ["Available skills:"]
         for skill in skills:
             source = f" [{skill.source}]"
+            path = f" {skill.path}" if skill.path else ""
             command_name = _skill_command_name(skill)
             slash = f" /{command_name}" if skill.user_invocable and _is_valid_skill_command_name(command_name) else ""
             display = f" ({skill.display_name})" if skill.display_name else ""
-            lines.append(f"- {command_name}{display}{source}{slash}: {skill.description}")
+            lines.append(f"- {command_name}{display}{source}{path}{slash}: {skill.description}")
         return CommandResult(message="\n".join(lines))
 
     async def _config_handler(args: str, context: CommandContext) -> CommandResult:

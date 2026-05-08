@@ -92,6 +92,31 @@ def test_select_from_menu_uses_questionary_when_tty(monkeypatch):
     assert answers
 
 
+def test_setup_flow_existing_api_key_profile_can_update_secret(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    from openharness.auth.manager import AuthManager
+    from openharness.auth.storage import load_credential
+
+    manager = AuthManager()
+    manager.store_profile_credential("openai-compatible", "api_key", "old-key")
+
+    selections = iter(["openai-compatible", "openai-compatible"])
+    monkeypatch.setattr("openharness.cli._select_setup_workflow", lambda *args, **kwargs: next(selections))
+    monkeypatch.setattr("openharness.cli._select_from_menu", lambda *args, **kwargs: next(selections))
+    monkeypatch.setattr("openharness.cli._confirm_prompt", lambda *args, **kwargs: True)
+    monkeypatch.setattr("openharness.auth.flows.ApiKeyFlow.run", lambda self: "new-key")
+    monkeypatch.setattr("openharness.cli._prompt_model_for_profile", lambda profile: "gpt-4.1")
+
+    result = runner.invoke(app, ["setup"])
+
+    assert result.exit_code == 0
+    assert "Setup complete:" in result.output
+    assert load_credential("openai", "api_key") == "new-key"
+
+
 def test_setup_flow_creates_kimi_profile_with_profile_scoped_key(tmp_path: Path, monkeypatch):
     runner = CliRunner()
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
@@ -127,6 +152,58 @@ def test_setup_flow_creates_kimi_profile_with_profile_scoped_key(tmp_path: Path,
     from openharness.auth.storage import load_credential
 
     assert load_credential("profile:kimi-anthropic", "api_key") == "sk-kimi-test"
+
+
+def test_provider_add_can_store_profile_api_key(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
+
+    from openharness.auth.storage import load_credential
+
+    result = runner.invoke(
+        app,
+        [
+            "provider",
+            "add",
+            "custom-openai",
+            "--label",
+            "Custom OpenAI",
+            "--provider",
+            "openai",
+            "--api-format",
+            "openai",
+            "--auth-source",
+            "openai_api_key",
+            "--model",
+            "gpt-4.1",
+            "--credential-slot",
+            "custom-openai",
+            "--api-key",
+            "new-key",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "API key set" in result.output
+    assert load_credential("profile:custom-openai", "api_key") == "new-key"
+
+
+def test_provider_edit_can_replace_profile_api_key(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    from openharness.auth.manager import AuthManager
+    from openharness.auth.storage import load_credential
+
+    manager = AuthManager()
+    manager.store_profile_credential("openai-compatible", "api_key", "old-key")
+
+    result = runner.invoke(app, ["provider", "edit", "openai-compatible", "--api-key", "new-key"])
+
+    assert result.exit_code == 0
+    assert "API key replaced" in result.output
+    assert load_credential("openai", "api_key") == "new-key"
 
 
 def test_dangerously_skip_permissions_passes_full_auto_to_run_repl(monkeypatch):
