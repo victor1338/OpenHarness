@@ -84,6 +84,13 @@ class OhmoGatewayService:
     def state_file(self) -> Path:
         return get_state_path(self._workspace)
 
+    def _channel_last_error(self) -> str | None:
+        for name, channel in self._manager.channels.items():
+            error = getattr(channel, "last_error", None)
+            if error:
+                return f"{name}: {error}"
+        return None
+
     def write_state(self, *, running: bool, last_error: str | None = None) -> None:
         state = GatewayState(
             running=running,
@@ -91,7 +98,7 @@ class OhmoGatewayService:
             active_sessions=self._runtime_pool.active_sessions,
             provider_profile=self._config.provider_profile,
             enabled_channels=self._config.enabled_channels,
-            last_error=last_error,
+            last_error=last_error or self._channel_last_error(),
         )
         self.state_file.write_text(state.model_dump_json(indent=2) + "\n", encoding="utf-8")
 
@@ -209,8 +216,18 @@ class OhmoGatewayService:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, _stop)
 
+        async def _state_heartbeat() -> None:
+            while not stop_event.is_set():
+                self.write_state(running=True)
+                await asyncio.sleep(5.0)
+
+        state_task = asyncio.create_task(_state_heartbeat(), name="ohmo-gateway-state")
+
         try:
             await stop_event.wait()
+        except Exception as exc:
+            self.write_state(running=False, last_error=str(exc))
+            raise
         finally:
             self._bridge.stop()
             bridge_task.cancel()
@@ -219,6 +236,10 @@ class OhmoGatewayService:
                 await bridge_task
             with contextlib.suppress(asyncio.CancelledError):
                 await manager_task
+            if not state_task.done():
+                state_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await state_task
             if not restart_notice_task.done():
                 restart_notice_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
