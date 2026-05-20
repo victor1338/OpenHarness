@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
 import socket
 from urllib.parse import urljoin, urlparse
 
@@ -57,15 +58,21 @@ async def fetch_public_http_response(
     params: dict[str, str] | None = None,
     timeout: float = 15.0,
     max_redirects: int = 5,
+    proxy: str | None = None,
 ) -> httpx.Response:
     """Fetch one HTTP resource while validating every redirect hop."""
     current_url = url
     current_params = params
 
+    resolved_proxy = proxy if proxy is not None else os.environ.get("OPENHARNESS_WEB_PROXY")
+    if resolved_proxy:
+        validate_http_url(resolved_proxy)
+
     async with httpx.AsyncClient(
         follow_redirects=False,
         timeout=timeout,
         trust_env=False,
+        proxy=resolved_proxy,
     ) as client:
         for redirect_count in range(max_redirects + 1):
             await ensure_public_http_url(current_url)
