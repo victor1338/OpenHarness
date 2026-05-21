@@ -45,9 +45,49 @@ from openharness.keybindings import load_keybindings
 
 PermissionPrompt = Callable[[str, str], Awaitable[bool]]
 AskUserPrompt = Callable[[str], Awaitable[str]]
+EditApprovalPrompt = Callable[[str, str, int, int], Awaitable[str]]
 SystemPrinter = Callable[[str], Awaitable[None]]
 StreamRenderer = Callable[[StreamEvent], Awaitable[None]]
 ClearHandler = Callable[[], Awaitable[None]]
+
+
+def _resolve_image_generation_config(settings) -> dict[str, str]:
+    """Resolve image generation configuration from settings, environment, and Codex auth."""
+    from openharness.config.settings import ImageGenerationConfig, ProviderProfile
+
+    cfg = settings.image_generation
+    env_cfg = ImageGenerationConfig.from_env()
+    resolved = {
+        "provider": cfg.provider or env_cfg.provider,
+        "model": cfg.model or env_cfg.model,
+        "api_key": cfg.api_key or env_cfg.api_key,
+        "base_url": cfg.base_url or env_cfg.base_url,
+        "codex_model": cfg.codex_model or env_cfg.codex_model,
+        "codex_base_url": cfg.codex_base_url or env_cfg.codex_base_url,
+    }
+
+    try:
+        codex_profile = settings.merged_profiles().get("codex") or ProviderProfile(
+            label="Codex Subscription",
+            provider="openai_codex",
+            api_format="openai",
+            auth_source="codex_subscription",
+            default_model="gpt-5.4",
+        )
+        codex_settings = settings.model_copy(
+            update={
+                "active_profile": "codex",
+                "profiles": {**settings.profiles, "codex": codex_profile},
+            }
+        ).materialize_active_profile()
+        codex_auth = codex_settings.resolve_auth()
+        resolved["codex_auth_token"] = codex_auth.value
+        resolved["codex_base_url"] = resolved["codex_base_url"] or (codex_settings.base_url or "")
+        resolved["codex_model"] = resolved["codex_model"] or codex_settings.model
+    except Exception:
+        pass
+
+    return resolved
 
 
 def _resolve_vision_config(settings) -> dict[str, str]:
@@ -98,6 +138,7 @@ class RuntimeBundle:
     extra_plugin_roots: tuple[str, ...] = ()
     memory_backend: MemoryCommandBackend | None = None
     include_project_memory: bool = True
+    autodream_context: dict[str, object] | None = None
 
     def current_settings(self):
         """Return the effective settings for this session.
@@ -208,6 +249,7 @@ async def build_runtime(
     cwd: str | None = None,
     model: str | None = None,
     max_turns: int | None = None,
+    effort: str | None = None,
     base_url: str | None = None,
     system_prompt: str | None = None,
     api_key: str | None = None,
@@ -216,6 +258,7 @@ async def build_runtime(
     api_client: SupportsStreamingMessages | None = None,
     permission_prompt: PermissionPrompt | None = None,
     ask_user_prompt: AskUserPrompt | None = None,
+    edit_approval_prompt: EditApprovalPrompt | None = None,
     restore_messages: list[dict] | None = None,
     restore_tool_metadata: dict[str, object] | None = None,
     enforce_max_turns: bool = True,
@@ -225,11 +268,13 @@ async def build_runtime(
     extra_plugin_roots: Iterable[str | Path] | None = None,
     memory_backend: MemoryCommandBackend | None = None,
     include_project_memory: bool = True,
+    autodream_context: dict[str, object] | None = None,
 ) -> RuntimeBundle:
     """Build the shared runtime for an OpenHarness session."""
     settings_overrides: dict[str, Any] = {
         "model": model,
         "max_turns": max_turns,
+        "effort": effort,
         "base_url": base_url,
         "system_prompt": system_prompt,
         "api_key": api_key,
@@ -341,16 +386,21 @@ async def build_runtime(
         permission_prompt=permission_prompt,
         ask_user_prompt=ask_user_prompt,
         hook_executor=hook_executor,
+        settings=settings,
         tool_metadata={
             "mcp_manager": mcp_manager,
             "bridge_manager": bridge_manager,
             "extra_skill_dirs": normalized_skill_dirs,
             "extra_plugin_roots": normalized_plugin_roots,
             "session_id": session_id,
+            "edit_approval_prompt": edit_approval_prompt,
             "vision_model_config": _resolve_vision_config(settings),
+            "image_generation_config": _resolve_image_generation_config(settings),
             **restored_metadata,
         },
     )
+    if autodream_context is not None:
+        engine.tool_metadata["autodream_context"] = autodream_context
     # Restore messages from a saved session if provided
     if restore_messages:
         restored = sanitize_conversation_messages(
@@ -389,6 +439,7 @@ async def build_runtime(
         extra_plugin_roots=normalized_plugin_roots,
         memory_backend=memory_backend,
         include_project_memory=include_project_memory,
+        autodream_context=autodream_context,
     )
 
 
@@ -532,6 +583,7 @@ async def handle_line(
     print_system: SystemPrinter,
     render_event: StreamRenderer,
     clear_output: ClearHandler,
+    user_message: ConversationMessage | None = None,
 ) -> bool:
     """Handle one submitted line for either headless or TUI rendering."""
     if not bundle.external_api_client:
@@ -554,7 +606,9 @@ async def handle_line(
         memory_backend=bundle.memory_backend,
         include_project_memory=bundle.include_project_memory,
     )
-    parsed = bundle.commands.lookup(line) or lookup_skill_slash_command(line, command_context)
+    parsed = None if user_message is not None else (
+        bundle.commands.lookup(line) or lookup_skill_slash_command(line, command_context)
+    )
     if parsed is not None:
         command, args = parsed
         result = await command.handler(
@@ -636,17 +690,18 @@ async def handle_line(
     settings = bundle.current_settings()
     if bundle.enforce_max_turns:
         bundle.engine.set_max_turns(settings.max_turns)
+    latest_user_prompt = line or (user_message.text if user_message is not None else "")
     system_prompt = build_runtime_system_prompt(
         settings,
         cwd=bundle.cwd,
-        latest_user_prompt=line,
+        latest_user_prompt=latest_user_prompt,
         extra_skill_dirs=bundle.extra_skill_dirs,
         extra_plugin_roots=bundle.extra_plugin_roots,
         include_project_memory=bundle.include_project_memory,
     )
     bundle.engine.set_system_prompt(system_prompt)
     try:
-        async for event in bundle.engine.submit_message(line):
+        async for event in bundle.engine.submit_message(user_message or line):
             await render_event(event)
     except MaxTurnsExceeded as exc:
         await print_system(f"Stopped after {exc.max_turns} turns (max_turns).")
