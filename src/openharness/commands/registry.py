@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -36,7 +37,29 @@ from openharness.memory import (
     get_memory_entrypoint,
     get_project_memory_dir,
     list_memory_files,
+    migrate_memory,
     remove_memory_entry,
+    scan_memory_files,
+)
+from openharness.memory.agent import (
+    ensure_agent_memory_vault,
+    get_agent_memory_entrypoint,
+    initialize_agent_memory_from_snapshot,
+)
+from openharness.memory.schema import (
+    DEFAULT_MEMORY_SCOPE,
+    DEFAULT_MEMORY_TYPE,
+    MEMORY_TYPES,
+    is_disabled_metadata,
+    is_memory_expired,
+    parse_memory_scope,
+    parse_memory_type,
+    split_memory_file,
+)
+from openharness.memory.team import (
+    check_team_memory_secrets,
+    ensure_team_memory_vault,
+    get_team_memory_dir,
 )
 from openharness.output_styles import load_output_styles
 from openharness.permissions import PermissionChecker, PermissionMode
@@ -49,6 +72,20 @@ from openharness.services import (
     compact_messages,
     estimate_conversation_tokens,
     summarize_messages,
+)
+from openharness.services.autodream import (
+    diff_memory_dirs,
+    format_memory_diff,
+    latest_memory_backup,
+    read_last_consolidated_at,
+    restore_memory_backup,
+    start_dream_now,
+)
+from openharness.services.memory_extract import extract_memories_from_turn
+from openharness.services.session_memory import (
+    get_session_memory_content,
+    get_session_memory_path,
+    update_session_memory_file,
 )
 from openharness.services.session_backend import DEFAULT_SESSION_BACKEND, SessionBackend
 from openharness.skills import load_skill_registry
@@ -82,6 +119,8 @@ class MemoryCommandBackend:
     """Storage backend used by the generic ``/memory`` slash command."""
 
     label: str
+    default_type: str
+    default_category: str
     get_memory_dir: Callable[[], Path]
     get_entrypoint: Callable[[], Path]
     list_files: Callable[[], list[Path]]
@@ -543,6 +582,97 @@ def create_default_command_registry(
             )
         )
 
+    async def _dream_handler(args: str, context: CommandContext) -> CommandResult:
+        settings = getattr(context.engine, "_settings", None) or load_settings().materialize_active_profile()
+        parts = args.split()
+        action = parts[0] if parts else "run"
+        backend = context.memory_backend if context.memory_backend is not None else None
+        memory_dir = backend.get_memory_dir() if backend is not None else get_project_memory_dir(context.cwd)
+        session_dir = context.session_backend.get_session_dir(context.cwd)
+        app_label = backend.label if backend is not None else "openharness project memory"
+        runner_module = "ohmo" if backend is not None and "ohmo" in backend.label.lower() else "openharness"
+        if action == "status":
+            last_at = read_last_consolidated_at(context.cwd, memory_dir=memory_dir)
+            last = "never" if last_at <= 0 else datetime.fromtimestamp(last_at).isoformat(timespec="seconds")
+            return CommandResult(
+                message=(
+                    f"Auto-dream: {'on' if settings.memory.auto_dream_enabled else 'off'}\n"
+                    f"Memory store: {app_label}\n"
+                    f"Memory directory: {memory_dir}\n"
+                    f"Session directory: {session_dir}\n"
+                    f"Last consolidated: {last}"
+                )
+            )
+        if action == "diff":
+            target = parts[1] if len(parts) > 1 else "latest"
+            task_memory_dir = str(memory_dir)
+            backup_dir = ""
+            label = target
+            if target == "latest":
+                latest = latest_memory_backup(memory_dir, app_label=app_label)
+                backup_dir = str(latest) if latest is not None else ""
+                label = "latest backup"
+            else:
+                task = get_task_manager().get_task(target)
+                if task is not None and task.type == "dream":
+                    backup_dir = task.metadata.get("backup_dir", "")
+                    task_memory_dir = task.metadata.get("memory_dir", str(memory_dir))
+                    label = task.id
+            if not backup_dir:
+                return CommandResult(message=f"No dream backup found for {target}.")
+            diff = diff_memory_dirs(backup_dir, task_memory_dir)
+            return CommandResult(
+                message=(
+                    f"Dream diff for {label}:\n"
+                    f"Backup: {backup_dir}\n"
+                    f"Memory: {task_memory_dir}\n"
+                    f"{format_memory_diff(diff)}"
+                )
+            )
+        if action == "rollback":
+            target = parts[1] if len(parts) > 1 else "latest"
+            task_memory_dir = str(memory_dir)
+            backup_dir = ""
+            label = target
+            if target == "latest":
+                latest = latest_memory_backup(memory_dir, app_label=app_label)
+                backup_dir = str(latest) if latest is not None else ""
+                label = "latest backup"
+            else:
+                task = get_task_manager().get_task(target)
+                if task is not None and task.type == "dream":
+                    backup_dir = task.metadata.get("backup_dir", "")
+                    task_memory_dir = task.metadata.get("memory_dir", str(memory_dir))
+                    label = task.id
+            if not backup_dir:
+                return CommandResult(message=f"No dream backup found for {target}.")
+            restore_memory_backup(backup_dir, task_memory_dir)
+            return CommandResult(message=f"Rolled back memory from backup for {label}: {backup_dir}")
+        if action not in {"run", "now", "preview"}:
+            return CommandResult(message="Usage: /dream [run|now|preview|status|diff [task_id]|rollback [task_id]]")
+        task = await start_dream_now(
+            cwd=context.cwd,
+            settings=settings,
+            model=context.engine.model,
+            current_session_id=context.session_id,
+            force=True,
+            memory_dir=memory_dir,
+            session_dir=session_dir,
+            app_label=app_label,
+            runner_module=runner_module,
+            preview=action == "preview",
+        )
+        if task is None:
+            return CommandResult(message="Dream did not start. Memory may be disabled or another dream is running.")
+        return CommandResult(
+            message=(
+                f"Started {'preview ' if action == 'preview' else ''}memory consolidation task {task.id}.\n"
+                f"Memory directory: {task.metadata.get('memory_dir', get_project_memory_dir(context.cwd))}\n"
+                f"Backup directory: {task.metadata.get('backup_dir', '') or '(preview/no backup)'}\n"
+                "Use /tasks or task_output to inspect progress. After completion: /dream diff latest or /dream rollback latest."
+            )
+        )
+
     async def _memory_handler(args: str, context: CommandContext) -> CommandResult:
         backend = _memory_backend_for_context(context)
         tokens = args.split(maxsplit=1)
@@ -551,7 +681,10 @@ def create_default_command_registry(
                 message=(
                     f"Memory store: {backend.label}\n"
                     f"Memory directory: {backend.get_memory_dir()}\n"
-                    f"Entrypoint: {backend.get_entrypoint()}"
+                    f"Entrypoint: {backend.get_entrypoint()}\n"
+                    "Commands: list, show NAME, add TITLE :: CONTENT, remove NAME, "
+                    "edit [NAME], validate, extract, session, team, agent, "
+                    "migrate --dry-run, migrate --apply"
                 )
             )
         action = tokens[0]
@@ -561,6 +694,37 @@ def create_default_command_registry(
             if not memory_files:
                 return CommandResult(message="No memory files.")
             return CommandResult(message="\n".join(path.name for path in memory_files))
+        if action == "migrate":
+            if rest not in {"--dry-run", "--apply"}:
+                return CommandResult(
+                    message=(
+                        "Usage: /memory "
+                        "[list|show NAME|add TITLE :: CONTENT|remove NAME|"
+                        "migrate --dry-run|migrate --apply]"
+                    )
+                )
+            summary = migrate_memory(
+                context.cwd,
+                memory_dir=backend.get_memory_dir(),
+                default_type=backend.default_type,
+                default_category=backend.default_category,
+                apply=rest == "--apply",
+            )
+            mode = "dry run" if summary.dry_run else "applied"
+            lines = [
+                f"Memory migration {mode}.",
+                f"Scanned: {summary.scanned}",
+                f"Changed: {summary.changed}",
+                f"Unchanged: {summary.unchanged}",
+                f"Failed: {summary.failed}",
+            ]
+            if summary.backup_dir:
+                lines.append(f"Backup: {summary.backup_dir}")
+            if summary.changed_files:
+                lines.append("Changed files: " + ", ".join(summary.changed_files))
+            if summary.failed_files:
+                lines.append("Failed files: " + ", ".join(summary.failed_files))
+            return CommandResult(message="\n".join(lines))
         if action == "show" and rest:
             memory_dir = backend.get_memory_dir()
             path, invalid = _resolve_memory_entry_path(memory_dir, rest)
@@ -570,18 +734,64 @@ def create_default_command_registry(
                 return CommandResult(message=f"Memory entry not found: {rest}")
             if not path.exists():
                 return CommandResult(message=f"Memory entry not found: {rest}")
-            return CommandResult(message=path.read_text(encoding="utf-8"))
+            content = path.read_text(encoding="utf-8")
+            metadata, _, _, _ = split_memory_file(content)
+            if is_disabled_metadata(metadata) or is_memory_expired(metadata):
+                return CommandResult(message=f"Memory entry not found: {rest}")
+            return CommandResult(message=content)
         if action == "add" and rest:
-            title, separator, content = rest.partition("::")
+            memory_type, scope, cleaned_rest = _parse_memory_add_flags(rest)
+            title, separator, content = cleaned_rest.partition("::")
             if not separator or not title.strip() or not content.strip():
-                return CommandResult(message="Usage: /memory add TITLE :: CONTENT")
-            path = backend.add_entry(title.strip(), content.strip())
+                return CommandResult(message="Usage: /memory add [--type TYPE] [--scope SCOPE] TITLE :: CONTENT")
+            if context.memory_backend is None:
+                path = add_memory_entry(
+                    context.cwd,
+                    title.strip(),
+                    content.strip(),
+                    memory_type=memory_type,
+                    scope=scope,
+                )
+            else:
+                path = backend.add_entry(title.strip(), content.strip())
             return CommandResult(message=f"Added memory entry {path.name}")
         if action == "remove" and rest:
             if backend.remove_entry(rest.strip()):
                 return CommandResult(message=f"Removed memory entry {rest.strip()}")
             return CommandResult(message=f"Memory entry not found: {rest.strip()}")
-        return CommandResult(message="Usage: /memory [list|show NAME|add TITLE :: CONTENT|remove NAME]")
+        if action == "edit":
+            return _handle_memory_edit_command(rest, context, backend)
+        if action == "validate":
+            return _handle_memory_validate_command(context)
+        if action == "extract":
+            if context.memory_backend is not None:
+                return CommandResult(message="Memory extraction is only supported for OpenHarness project memory.")
+            result = await extract_memories_from_turn(
+                cwd=context.cwd,
+                api_client=context.engine.api_client,
+                model=context.engine.model,
+                messages=context.engine.messages,
+                max_records=load_settings().memory.auto_extract_max_records,
+            )
+            if result.skipped:
+                return CommandResult(message=f"Memory extraction skipped: {result.reason}")
+            return CommandResult(
+                message="Memory extraction wrote:\n" + "\n".join(f"- {path}" for path in result.written_paths)
+            )
+        if action == "session":
+            return _handle_memory_session_command(rest, context)
+        if action == "team":
+            return _handle_memory_team_command(rest, context)
+        if action == "agent":
+            return _handle_memory_agent_command(rest, context)
+        return CommandResult(
+            message=(
+                "Usage: /memory "
+                "[list|show NAME|add TITLE :: CONTENT|remove NAME|edit [NAME]|"
+                "validate|extract|session|team|agent|"
+                "migrate --dry-run|migrate --apply]"
+            )
+        )
 
     async def _hooks_handler(_: str, context: CommandContext) -> CommandResult:
         return CommandResult(message=context.hooks_summary or "No hooks configured.")
@@ -1024,10 +1234,13 @@ def create_default_command_registry(
         value = args.strip() or "show"
         if value == "show":
             return CommandResult(message=f"Reasoning effort: {current}")
-        if value not in {"low", "medium", "high"}:
-            return CommandResult(message="Usage: /effort [show|low|medium|high]")
+        if value == "max":
+            value = "xhigh"
+        if value not in {"low", "medium", "high", "xhigh"}:
+            return CommandResult(message="Usage: /effort [show|low|medium|high|xhigh]")
         settings.effort = value
         save_settings(settings)
+        context.engine.set_effort(value)
         context.engine.set_system_prompt(
             build_runtime_system_prompt(
                 settings,
@@ -2117,6 +2330,7 @@ def create_default_command_registry(
     registry.register(SlashCommand("cost", "Show token usage and estimated cost", _cost_handler))
     registry.register(SlashCommand("usage", "Show usage and token estimates", _usage_handler))
     registry.register(SlashCommand("stats", "Show session statistics", _stats_handler))
+    registry.register(SlashCommand("dream", "Consolidate memory", _dream_handler))
     registry.register(SlashCommand("memory", "Inspect and manage project memory", _memory_handler))
     registry.register(SlashCommand("hooks", "Show configured hooks", _hooks_handler))
     registry.register(SlashCommand("resume", "Restore the latest saved session", _resume_handler))
@@ -2243,9 +2457,25 @@ def create_default_command_registry(
     registry.register(SlashCommand("vim", "Show or update Vim mode", _vim_handler))
     registry.register(SlashCommand("voice", "Show or update voice mode", _voice_handler))
     registry.register(SlashCommand("doctor", "Show environment diagnostics", _doctor_handler))
-    registry.register(SlashCommand("diff", "Show git diff output", _diff_handler))
+    registry.register(
+        SlashCommand(
+            "diff",
+            "Show git diff output",
+            _diff_handler,
+            remote_invocable=False,
+            remote_admin_opt_in=True,
+        )
+    )
     registry.register(SlashCommand("branch", "Show git branch information", _branch_handler))
-    registry.register(SlashCommand("commit", "Show status or create a git commit", _commit_handler))
+    registry.register(
+        SlashCommand(
+            "commit",
+            "Show status or create a git commit",
+            _commit_handler,
+            remote_invocable=False,
+            remote_admin_opt_in=True,
+        )
+    )
     registry.register(SlashCommand("issue", "Show or update project issue context", _issue_handler))
     registry.register(SlashCommand("pr_comments", "Show or update project PR comments context", _pr_comments_handler))
     registry.register(SlashCommand("privacy-settings", "Show local privacy and storage settings", _privacy_settings_handler))
@@ -2254,8 +2484,24 @@ def create_default_command_registry(
     registry.register(SlashCommand("upgrade", "Show upgrade instructions", _upgrade_handler))
     registry.register(SlashCommand("agents", "List or inspect agent and teammate tasks", _agents_handler))
     registry.register(SlashCommand("subagents", "Show subagent usage and inspect worker tasks", _agents_handler))
-    registry.register(SlashCommand("tasks", "Manage background tasks", _tasks_handler))
-    registry.register(SlashCommand("autopilot", "Manage repo autopilot intake and context", _autopilot_handler))
+    registry.register(
+        SlashCommand(
+            "tasks",
+            "Manage background tasks",
+            _tasks_handler,
+            remote_invocable=False,
+            remote_admin_opt_in=True,
+        )
+    )
+    registry.register(
+        SlashCommand(
+            "autopilot",
+            "Manage repo autopilot intake and context",
+            _autopilot_handler,
+            remote_invocable=False,
+            remote_admin_opt_in=True,
+        )
+    )
     registry.register(
         SlashCommand(
             "ship",
@@ -2298,6 +2544,158 @@ def create_default_command_registry(
     return registry
 
 
+def _handle_memory_edit_command(
+    args: str,
+    context: CommandContext,
+    backend: MemoryCommandBackend,
+) -> CommandResult:
+    memory_dir = backend.get_memory_dir()
+    target = backend.get_entrypoint()
+    if args.strip():
+        path, invalid = _resolve_memory_entry_path(memory_dir, args.strip())
+        if invalid:
+            return CommandResult(message="Memory entry path must stay within the configured memory directory.")
+        if path is None:
+            return CommandResult(message=f"Memory entry not found: {args.strip()}")
+        target = path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.touch(exist_ok=True)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        return CommandResult(message=f"Memory file ready: {target}\nSet $VISUAL or $EDITOR to open it from /memory edit.")
+    result = subprocess.run([editor, str(target)], cwd=context.cwd, check=False)
+    if result.returncode != 0:
+        return CommandResult(message=f"Editor exited with status {result.returncode}: {editor}")
+    return CommandResult(message=f"Edited memory file: {target}")
+
+
+def _parse_memory_add_flags(args: str):
+    """Parse optional ``/memory add`` type/scope flags."""
+
+    memory_type = DEFAULT_MEMORY_TYPE
+    scope = DEFAULT_MEMORY_SCOPE
+    rest = args.strip()
+    changed = True
+    while changed:
+        changed = False
+        if rest.startswith("--type "):
+            _, _, tail = rest.partition(" ")
+            raw, _, rest = tail.partition(" ")
+            parsed = parse_memory_type(raw, default=DEFAULT_MEMORY_TYPE)
+            if parsed is not None:
+                memory_type = parsed
+            changed = True
+        if rest.startswith("--scope "):
+            _, _, tail = rest.partition(" ")
+            raw, _, rest = tail.partition(" ")
+            parsed_scope = parse_memory_scope(raw, default=DEFAULT_MEMORY_SCOPE)
+            if parsed_scope is not None:
+                scope = parsed_scope
+            changed = True
+    return memory_type, scope, rest
+
+
+def _handle_memory_validate_command(context: CommandContext) -> CommandResult:
+    memory_dir = get_project_memory_dir(context.cwd)
+    headers = scan_memory_files(context.cwd, max_files=500)
+    issues: list[str] = []
+    for header in headers:
+        raw_type = header.frontmatter.get("type") or header.frontmatter.get("memory_type")
+        if parse_memory_type(raw_type) is None:
+            issues.append(
+                f"- {header.relative_path}: invalid or missing type {raw_type!r}; expected {', '.join(MEMORY_TYPES)}"
+            )
+        if "team" in Path(header.relative_path).parts:
+            try:
+                text = header.path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            secret_error = check_team_memory_secrets(text)
+            if secret_error:
+                issues.append(f"- {header.relative_path}: {secret_error}")
+    if not issues:
+        return CommandResult(
+            message=(
+                "Memory validation passed.\n"
+                f"- files: {len(headers)}\n"
+                f"- memory_dir: {memory_dir}"
+            )
+        )
+    return CommandResult(message="Memory validation issues:\n" + "\n".join(issues))
+
+
+def _handle_memory_session_command(args: str, context: CommandContext) -> CommandResult:
+    action = args.split(maxsplit=1)[0] if args.strip() else "status"
+    path = get_session_memory_path(context.cwd, context.session_id or "default")
+    if action == "update":
+        path = update_session_memory_file(
+            context.cwd,
+            context.engine.messages,
+            tool_metadata=context.engine.tool_metadata,
+            session_id=context.session_id or "default",
+        )
+        return CommandResult(message=f"Updated session memory: {path}")
+    if action == "show":
+        content = get_session_memory_content(path)
+        return CommandResult(message=content or f"No session memory at {path}")
+    return CommandResult(
+        message=(
+            "Session memory:\n"
+            f"- path: {path}\n"
+            f"- exists: {path.exists()}\n"
+            "Commands: /memory session [status|show|update]"
+        )
+    )
+
+
+def _handle_memory_team_command(args: str, context: CommandContext) -> CommandResult:
+    action = args.split(maxsplit=1)[0] if args.strip() else "status"
+    team_dir = ensure_team_memory_vault(context.cwd)
+    if action == "list":
+        files = sorted(path for path in team_dir.rglob("*.md") if path.name != "MEMORY.md")
+        return CommandResult(message="\n".join(str(path.relative_to(team_dir)) for path in files) or "No team memory files.")
+    if action == "validate":
+        issues: list[str] = []
+        for path in sorted(team_dir.rglob("*.md")):
+            if path.name == "MEMORY.md":
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            secret_error = check_team_memory_secrets(text)
+            if secret_error:
+                issues.append(f"- {path.relative_to(team_dir)}: {secret_error}")
+        return CommandResult(message="Team memory validation passed." if not issues else "\n".join(issues))
+    return CommandResult(
+        message=(
+            "Team memory:\n"
+            f"- directory: {get_team_memory_dir(context.cwd)}\n"
+            f"- exists: {team_dir.exists()}\n"
+            "Commands: /memory team [status|list|validate]"
+        )
+    )
+
+
+def _handle_memory_agent_command(args: str, context: CommandContext) -> CommandResult:
+    parts = args.split()
+    action = parts[0] if parts else "status"
+    agent_type = parts[1] if len(parts) > 1 else "default"
+    scope = parts[2] if len(parts) > 2 else "project"
+    if scope not in {"user", "project", "local"}:
+        return CommandResult(message="Agent memory scope must be one of: user, project, local")
+    if action == "snapshot":
+        target = initialize_agent_memory_from_snapshot(context.cwd, agent_type, scope)  # type: ignore[arg-type]
+        return CommandResult(message=f"Initialized agent memory from snapshot: {target}" if target else "No snapshot found.")
+    vault = ensure_agent_memory_vault(context.cwd, agent_type, scope)  # type: ignore[arg-type]
+    return CommandResult(
+        message=(
+            "Agent memory:\n"
+            f"- agent_type: {agent_type}\n"
+            f"- scope: {scope}\n"
+            f"- directory: {vault}\n"
+            f"- entrypoint: {get_agent_memory_entrypoint(context.cwd, agent_type, scope)}"
+        )
+    )
+
+
 def _resolve_memory_entry_path(memory_dir: Path, candidate: str) -> tuple[Path | None, bool]:
     """Resolve a memory entry path while enforcing containment under ``memory_dir``."""
 
@@ -2330,6 +2728,8 @@ def _memory_backend_for_context(context: CommandContext) -> MemoryCommandBackend
     cwd = context.cwd
     return MemoryCommandBackend(
         label="OpenHarness project memory",
+        default_type="project",
+        default_category="knowledge",
         get_memory_dir=lambda: get_project_memory_dir(cwd),
         get_entrypoint=lambda: get_memory_entrypoint(cwd),
         list_files=lambda: list_memory_files(cwd),
