@@ -35,6 +35,8 @@ class TelegramConfig(BaseChannelConfig):
     token: str = ""
     chat_id: str | None = None
     proxy: str | None = None
+    reply_to_message: bool = True
+    bot_name: str = "ohmo"
 
 
 class SlackConfig(BaseChannelConfig):

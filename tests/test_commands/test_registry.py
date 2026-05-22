@@ -8,12 +8,18 @@ from pathlib import Path
 import pytest
 
 import openharness.commands.registry as registry_module
-from openharness.commands.registry import CommandContext, create_default_command_registry, lookup_skill_slash_command
+from openharness.commands.registry import (
+    CommandContext,
+    MemoryCommandBackend,
+    create_default_command_registry,
+    lookup_skill_slash_command,
+)
 from openharness.autopilot import RepoVerificationStep
 from openharness.config.paths import get_feedback_log_path, get_project_issue_file, get_project_pr_comments_file
 from openharness.config.settings import load_settings, save_settings, Settings
 from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.engine.query_engine import QueryEngine
+from openharness.memory.paths import get_project_memory_dir
 from openharness.mcp.types import McpHttpServerConfig, McpStdioServerConfig
 from openharness.permissions import PermissionChecker
 from openharness.plugins.types import PluginCommandDefinition
@@ -161,6 +167,59 @@ async def test_bridge_command_supports_explicit_remote_admin_opt_in(tmp_path: Pa
     assert getattr(command, "remote_admin_opt_in", False) is True
 
 
+@pytest.mark.asyncio
+async def test_autopilot_command_is_marked_local_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/autopilot run-next")
+    assert command is not None
+    assert command.remote_invocable is False
+
+
+@pytest.mark.asyncio
+async def test_autopilot_command_supports_explicit_remote_admin_opt_in(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/autopilot run-next")
+    assert command is not None
+    assert getattr(command, "remote_admin_opt_in", False) is True
+
+
+@pytest.mark.asyncio
+async def test_diff_command_is_marked_local_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/diff full")
+    assert command is not None
+    assert command.remote_invocable is False
+
+
+@pytest.mark.asyncio
+async def test_diff_command_supports_explicit_remote_admin_opt_in(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/diff full")
+    assert command is not None
+    assert getattr(command, "remote_admin_opt_in", False) is True
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_is_marked_local_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/tasks run id")
+    assert command is not None
+    assert command.remote_invocable is False
+
+
+@pytest.mark.asyncio
+async def test_tasks_command_supports_explicit_remote_admin_opt_in(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/tasks run id")
+    assert command is not None
+    assert getattr(command, "remote_admin_opt_in", False) is True
+
 
 @pytest.mark.asyncio
 async def test_sensitive_control_plane_commands_are_local_only(tmp_path: Path, monkeypatch):
@@ -174,6 +233,7 @@ async def test_sensitive_control_plane_commands_are_local_only(tmp_path: Path, m
         "/mcp",
         "/provider",
         "/model show",
+        "/commit remote requested commit",
         "/ship",
     ):
         command, _ = registry.lookup(payload)
@@ -845,6 +905,67 @@ async def test_memory_command_manages_entries(tmp_path: Path, monkeypatch):
     remove_result = await remove_command.handler(remove_args, context)
     assert "Removed memory entry" in remove_result.message
 
+    list_after_remove = await list_command.handler(list_args, context)
+    assert "pytest_tips.md" not in list_after_remove.message
+
+    show_after_remove = await show_command.handler(show_args, context)
+    assert show_after_remove.message == "Memory entry not found: pytest_tips"
+
+
+@pytest.mark.asyncio
+async def test_memory_command_migrates_entries(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    memory_dir = get_project_memory_dir(tmp_path)
+    legacy = memory_dir / "legacy.md"
+    legacy.write_text("legacy command note\n", encoding="utf-8")
+    registry = create_default_command_registry()
+    context = _make_context(tmp_path)
+
+    dry_command, dry_args = registry.lookup("/memory migrate --dry-run")
+    dry_result = await dry_command.handler(dry_args, context)
+
+    assert "Memory migration dry run." in dry_result.message
+    assert "Changed: 1" in dry_result.message
+    assert "schema_version" not in legacy.read_text(encoding="utf-8")
+
+    apply_command, apply_args = registry.lookup("/memory migrate --apply")
+    apply_result = await apply_command.handler(apply_args, context)
+
+    assert "Memory migration applied." in apply_result.message
+    assert "Backup:" in apply_result.message
+    assert "schema_version: 1" in legacy.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_memory_migrate_uses_backend_defaults_not_label(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    memory_dir = tmp_path / "custom-memory"
+    memory_dir.mkdir()
+    legacy = memory_dir / "legacy.md"
+    legacy.write_text("personal preference note\n", encoding="utf-8")
+    registry = create_default_command_registry()
+    context = _make_context(tmp_path)
+    context.memory_backend = MemoryCommandBackend(
+        label="renamed user notes",
+        default_type="personal",
+        default_category="preference",
+        get_memory_dir=lambda: memory_dir,
+        get_entrypoint=lambda: memory_dir / "MEMORY.md",
+        list_files=lambda: [],
+        add_entry=lambda title, content: memory_dir / f"{title}.md",
+        remove_entry=lambda name: False,
+    )
+
+    apply_command, apply_args = registry.lookup("/memory migrate --apply")
+    result = await apply_command.handler(apply_args, context)
+
+    migrated = legacy.read_text(encoding="utf-8")
+    assert "Memory migration applied." in result.message
+    assert 'type: "personal"' in migrated
+    assert 'category: "preference"' in migrated
+
 
 @pytest.mark.asyncio
 async def test_compact_summary_and_usage_commands(tmp_path: Path, monkeypatch):
@@ -923,6 +1044,12 @@ async def test_ui_mode_commands_persist_and_update_state(tmp_path: Path, monkeyp
     assert "high" in effort_result.message
     assert load_settings().effort == "high"
     assert context.app_state.get().effort == "high"
+
+    effort_command, effort_args = registry.lookup("/effort xhigh")
+    effort_result = await effort_command.handler(effort_args, context)
+    assert "xhigh" in effort_result.message
+    assert load_settings().effort == "xhigh"
+    assert context.app_state.get().effort == "xhigh"
 
     passes_command, passes_args = registry.lookup("/passes 3")
     passes_result = await passes_command.handler(passes_args, context)
