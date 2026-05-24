@@ -11,6 +11,12 @@ export type TranscriptItem = {
 	is_error?: boolean;
 };
 
+export type ImageAttachmentPayload = {
+	media_type: string;
+	data: string;
+	source_path?: string;
+};
+
 export type TaskSnapshot = {
 	id: string;
 	type: string;
