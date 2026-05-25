@@ -405,6 +405,7 @@ def _build_dry_run_preview(
     api_key: str | None,
     api_format: str | None,
     permission_mode: str | None,
+    effort: str | None = None,
 ) -> dict[str, object]:
     from openharness.api.provider import auth_status, detect_provider
     from openharness.commands import create_default_command_registry
@@ -425,6 +426,7 @@ def _build_dry_run_preview(
         api_key=api_key,
         api_format=api_format,
         permission_mode=permission_mode,
+        effort=effort,
     )
     provider = detect_provider(settings)
     auth = auth_status(settings)
@@ -930,8 +932,20 @@ def cron_list_cmd() -> None:
             last = last[:19]  # trim to readable datetime
         last_status = job.get("last_status", "")
         status_indicator = f" [{last_status}]" if last_status else ""
-        print(f"  [{enabled}] {job['name']}  {job.get('schedule', '?')}")
-        print(f"        cmd: {job['command']}")
+        timezone = f" ({job['timezone']})" if job.get("timezone") else ""
+        print(f"  [{enabled}] {job['name']}  {job.get('schedule', '?')}{timezone}")
+        print(f"        cmd: {job.get('command') or '(agent_turn)'}")
+        payload = job.get("payload")
+        if isinstance(payload, dict):
+            print(
+                f"        payload: {payload.get('kind', 'agent_turn')} -> "
+                f"{payload.get('channel', '?')}:{payload.get('to', '?')}"
+            )
+        notify = job.get("notify")
+        if isinstance(notify, dict):
+            notify_type = notify.get("type", "?")
+            target = notify.get("user_open_id") or notify.get("open_id") or notify.get("chat_id") or "?"
+            print(f"        notify: {notify_type} -> {target}")
         print(f"        last: {last}{status_indicator}  next: {job.get('next_run', 'n/a')[:19]}")
 
 
@@ -2139,7 +2153,7 @@ def main(
     effort: str | None = typer.Option(
         None,
         "--effort",
-        help="Effort level for the session (low, medium, high, max)",
+        help="Effort level for the session (low, medium, high, xhigh/max)",
         rich_help_panel="Model & Effort",
     ),
     verbose: bool = typer.Option(
@@ -2334,6 +2348,7 @@ def main(
             api_key=api_key,
             api_format=api_format,
             permission_mode=permission_mode,
+            effort=effort,
         )
         effective_output_format = output_format or "text"
         if effective_output_format == "text":
@@ -2407,6 +2422,7 @@ def main(
                 restore_tool_metadata=session_data.get("tool_metadata"),
                 permission_mode=permission_mode,
                 api_format=api_format,
+                effort=effort,
             )
         )
         return
@@ -2429,6 +2445,7 @@ def main(
                 api_format=api_format,
                 permission_mode=permission_mode,
                 max_turns=max_turns,
+                effort=effort,
             )
         )
         return
@@ -2444,6 +2461,7 @@ def main(
                 api_key=api_key,
                 api_format=api_format,
                 permission_mode=permission_mode,
+                effort=effort,
             )
         )
         return
@@ -2460,5 +2478,6 @@ def main(
             api_key=api_key,
             api_format=api_format,
             permission_mode=permission_mode,
+            effort=effort,
         )
     )
