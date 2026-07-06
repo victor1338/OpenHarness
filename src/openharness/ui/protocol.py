@@ -4,12 +4,34 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from openharness.state.app_state import AppState
 from openharness.bridge.manager import BridgeSessionRecord
 from openharness.mcp.types import McpConnectionStatus
 from openharness.tasks.types import TaskRecord
+
+
+class FrontendImageAttachment(BaseModel):
+    """Base64 image payload submitted from the React TUI."""
+
+    media_type: str
+    data: str
+    source_path: str | None = None
+
+    @field_validator("media_type")
+    @classmethod
+    def _validate_media_type(cls, value: str) -> str:
+        if not value.startswith("image/"):
+            raise ValueError("image attachment media_type must start with image/")
+        return value
+
+    @field_validator("data")
+    @classmethod
+    def _validate_data(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("image attachment data is required")
+        return value
 
 
 class FrontendRequest(BaseModel):
@@ -30,7 +52,9 @@ class FrontendRequest(BaseModel):
     value: str | None = None
     request_id: str | None = None
     allowed: bool | None = None
+    permission_reply: str | None = None
     answer: str | None = None
+    images: list[FrontendImageAttachment] = Field(default_factory=list)
 
 
 class TranscriptItem(BaseModel):
@@ -217,6 +241,7 @@ def _format_permission_mode(raw: str) -> str:
 
 __all__ = [
     "BackendEvent",
+    "FrontendImageAttachment",
     "FrontendRequest",
     "TaskSnapshot",
     "TranscriptItem",
