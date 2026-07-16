@@ -100,6 +100,26 @@ def test_convert_messages_to_codex():
     }
 
 
+def test_convert_user_message_with_tool_result_before_text_to_codex():
+    messages = [
+        ConversationMessage(
+            role="user",
+            content=[
+                ToolResultBlock(tool_use_id="call_123", content="done", is_error=False),
+                TextBlock(text="next request"),
+            ],
+        )
+    ]
+
+    converted = _convert_messages_to_codex(messages)
+
+    assert converted == [
+        {"type": "function_call_output", "call_id": "call_123", "output": "done"},
+        {"role": "user", "content": [{"type": "input_text", "text": "next request"}]},
+    ]
+
+
+
 def test_convert_multimodal_user_message_to_codex():
     messages = [
         ConversationMessage(
@@ -168,9 +188,10 @@ async def test_codex_client_streams_text(monkeypatch):
 
     client = CodexApiClient(_fake_codex_token())
     request = ApiMessageRequest(
-        model="gpt-5.4",
+        model="gpt-5.5",
         messages=[ConversationMessage.from_user_text("hi")],
         system_prompt="Be helpful.",
+        effort="xhigh",
     )
     events = [event async for event in client.stream_message(request)]
 
@@ -181,6 +202,8 @@ async def test_codex_client_streams_text(monkeypatch):
     assert complete.usage.output_tokens == 3
     assert sink["url"].endswith("/codex/responses")
     assert sink["json"]["instructions"] == "Be helpful."
+    assert sink["json"]["model"] == "gpt-5.5"
+    assert sink["json"]["reasoning"] == {"effort": "xhigh"}
     assert sink["headers"]["OpenAI-Beta"] == "responses=experimental"
 
 
