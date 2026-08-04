@@ -8,11 +8,18 @@ from typing import AsyncIterator
 from openharness.api.client import SupportsStreamingMessages
 from openharness.engine.cost_tracker import CostTracker
 from openharness.coordinator.coordinator_mode import get_coordinator_user_context
+<<<<<<< HEAD
 from openharness.engine.messages import ConversationMessage, TextBlock, ToolResultBlock
 from openharness.engine.query import AskUserPrompt, MaxTurnsExceeded, PermissionPrompt, QueryContext, remember_user_goal, run_query
+=======
+from openharness.engine.messages import ConversationMessage, TextBlock, ToolResultBlock, sanitize_conversation_messages
+from openharness.engine.query import AskUserPrompt, PermissionPrompt, QueryContext, remember_user_goal, run_query
+>>>>>>> upstream/main
 from openharness.engine.stream_events import AssistantTurnComplete, StreamEvent
+from openharness.config.settings import Settings
 from openharness.hooks import HookEvent, HookExecutor
 from openharness.permissions.checker import PermissionChecker
+from openharness.services.autodream.service import schedule_auto_dream
 from openharness.tools.base import ToolRegistry
 
 
@@ -36,6 +43,7 @@ class QueryEngine:
         ask_user_prompt: AskUserPrompt | None = None,
         hook_executor: HookExecutor | None = None,
         tool_metadata: dict[str, object] | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._api_client = api_client
         self._tool_registry = tool_registry
@@ -44,6 +52,7 @@ class QueryEngine:
         self._model = model
         self._system_prompt = system_prompt
         self._max_tokens = max_tokens
+        self._effort = settings.effort if settings is not None else None
         self._context_window_tokens = context_window_tokens
         self._auto_compact_threshold_tokens = auto_compact_threshold_tokens
         self._max_turns = max_turns
@@ -51,6 +60,7 @@ class QueryEngine:
         self._ask_user_prompt = ask_user_prompt
         self._hook_executor = hook_executor
         self._tool_metadata = tool_metadata or {}
+        self._settings = settings
         self._messages: list[ConversationMessage] = []
         self._cost_tracker = CostTracker()
 
@@ -102,6 +112,10 @@ class QueryEngine:
         """Update the active model for future turns."""
         self._model = model
 
+    def set_effort(self, effort: str | None) -> None:
+        """Update the active reasoning effort for future turns."""
+        self._effort = effort
+
     def set_api_client(self, api_client: SupportsStreamingMessages) -> None:
         """Update the active API client for future turns."""
         self._api_client = api_client
@@ -129,6 +143,77 @@ class QueryEngine:
         """Replace the in-memory conversation history."""
         self._messages = list(messages)
 
+    def _schedule_auto_dream(self) -> None:
+        """Fire-and-forget background memory consolidation after a user turn."""
+        if self._settings is None:
+            return
+        context = self._tool_metadata.get("autodream_context")
+        kwargs = dict(context) if isinstance(context, dict) else {}
+        schedule_auto_dream(
+            cwd=self._cwd,
+            settings=self._settings,
+            model=self._model,
+            current_session_id=str(self._tool_metadata.get("session_id") or ""),
+            **kwargs,
+        )
+
+    def _prepare_session_memory(self) -> None:
+        """Expose file-backed session memory to compaction when enabled."""
+
+        if self._settings is None or not self._settings.memory.session_memory_enabled:
+            return
+        if not self._settings.memory.enabled:
+            return
+        from openharness.services.session_memory import prepare_session_memory_metadata
+
+        prepare_session_memory_metadata(
+            self._cwd,
+            self._tool_metadata,
+            session_id=str(self._tool_metadata.get("session_id") or "default"),
+        )
+
+    async def _update_session_memory(self) -> None:
+        """Persist a session checkpoint after a user turn."""
+
+        if self._settings is None or not self._settings.memory.session_memory_enabled:
+            return
+        if not self._settings.memory.enabled:
+            return
+        from openharness.services.session_memory import update_session_memory_file
+
+        update_session_memory_file(
+            self._cwd,
+            list(self._messages),
+            tool_metadata=self._tool_metadata,
+            session_id=str(self._tool_metadata.get("session_id") or "default"),
+        )
+
+    async def _extract_durable_memories(self) -> None:
+        """Run the optional durable memory extraction pass."""
+
+        if self._settings is None or not self._settings.memory.auto_extract_enabled:
+            return
+        if not self._settings.memory.enabled:
+            return
+        from openharness.services.memory_extract import extract_memories_from_turn
+
+        try:
+            result = await extract_memories_from_turn(
+                cwd=self._cwd,
+                api_client=self._api_client,
+                model=self._model,
+                messages=list(self._messages),
+                max_records=self._settings.memory.auto_extract_max_records,
+            )
+        except Exception as exc:
+            self._tool_metadata["memory_extract_last_error"] = str(exc)
+            return
+        self._tool_metadata["memory_extract_last"] = {
+            "skipped": result.skipped,
+            "reason": result.reason,
+            "written_paths": [str(path) for path in result.written_paths],
+        }
+
     def has_pending_continuation(self) -> bool:
         """Return True when the conversation ends with tool results awaiting a follow-up model turn."""
         if not self._messages:
@@ -153,6 +238,8 @@ class QueryEngine:
         )
         if user_message.text.strip() and not self._tool_metadata.pop("_suppress_next_user_goal", False):
             remember_user_goal(self._tool_metadata, user_message.text)
+        self._prepare_session_memory()
+        self._messages = sanitize_conversation_messages(self._messages)
         self._messages.append(user_message)
         if self._hook_executor is not None:
             await self._hook_executor.execute(
@@ -170,6 +257,7 @@ class QueryEngine:
             model=self._model,
             system_prompt=self._system_prompt,
             max_tokens=self._max_tokens,
+            effort=self._effort,
             context_window_tokens=self._context_window_tokens,
             auto_compact_threshold_tokens=self._auto_compact_threshold_tokens,
             max_turns=self._max_turns,
@@ -189,15 +277,24 @@ class QueryEngine:
                 if usage is not None:
                     self._cost_tracker.add(usage)
                 yield event
+<<<<<<< HEAD
         except MaxTurnsExceeded:
             # run_query mutates query_messages in-place before raising MaxTurnsExceeded.
             # Sync self._messages so the final tool results are preserved,
             # enabling has_pending_continuation() to return True for /continue.
             self._messages = list(query_messages)
             raise
+=======
+        finally:
+            await self._update_session_memory()
+            await self._extract_durable_memories()
+            self._schedule_auto_dream()
+>>>>>>> upstream/main
 
     async def continue_pending(self, *, max_turns: int | None = None) -> AsyncIterator[StreamEvent]:
         """Continue an interrupted tool loop without appending a new user message."""
+        self._prepare_session_memory()
+        self._messages = sanitize_conversation_messages(self._messages)
         context = QueryContext(
             api_client=self._api_client,
             tool_registry=self._tool_registry,
@@ -206,6 +303,7 @@ class QueryEngine:
             model=self._model,
             system_prompt=self._system_prompt,
             max_tokens=self._max_tokens,
+            effort=self._effort,
             context_window_tokens=self._context_window_tokens,
             auto_compact_threshold_tokens=self._auto_compact_threshold_tokens,
             max_turns=max_turns if max_turns is not None else self._max_turns,
@@ -218,3 +316,5 @@ class QueryEngine:
             if usage is not None:
                 self._cost_tracker.add(usage)
             yield event
+        await self._update_session_memory()
+        await self._extract_durable_memories()
