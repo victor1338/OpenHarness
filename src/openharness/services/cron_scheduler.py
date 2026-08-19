@@ -9,17 +9,22 @@ log.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import subprocess
+import shlex
 import signal
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from types import FrameType
+from typing import Any, Callable
 
 from openharness.config.paths import get_data_dir, get_logs_dir
+from openharness.platforms import get_platform
 from openharness.services.cron import (
     load_cron_jobs,
     mark_job_run,
@@ -27,6 +32,14 @@ from openharness.services.cron import (
 )
 from openharness.sandbox import SandboxUnavailableError
 from openharness.utils.shell import create_shell_subprocess
+
+try:
+    from ohmo.gateway.config import load_gateway_config
+except Exception:  # pragma: no cover - ohmo is optional for non-ohmo cron users
+    load_gateway_config = None  # type: ignore[assignment]
+
+
+NOTIFICATION_OUTPUT_LIMIT = 3500
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +102,7 @@ def read_pid() -> int | None:
         pid = int(path.read_text(encoding="utf-8").strip())
     except (ValueError, OSError):
         return None
-    # Check if process is alive
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    if not _pid_exists(pid):
         logger.debug("Removed stale scheduler PID file (pid=%d)", pid)
         path.unlink(missing_ok=True)
         return None
@@ -122,37 +132,205 @@ def stop_scheduler() -> bool:
     if pid is None:
         return False
     try:
-        os.kill(pid, signal.SIGTERM)
+        _terminate_pid(pid)
     except OSError:
         remove_pid()
         return False
     # Wait briefly for process to exit
     for _ in range(10):
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        if not _pid_exists(pid):
             remove_pid()
             return True
         time.sleep(0.2)
     # Force kill
     try:
-        os.kill(pid, signal.SIGKILL)
+        _kill_pid(pid)
     except OSError:
         pass
     remove_pid()
     return True
 
 
+def _pid_exists(pid: int) -> bool:
+    """Return True when *pid* currently refers to a live process."""
+    if pid <= 0:
+        return False
+    if get_platform() == "windows":
+        return _windows_pid_exists(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _windows_pid_exists(pid: int) -> bool:
+    """Windows implementation of ``kill(pid, 0)`` without requiring psutil."""
+    try:
+        import ctypes
+    except Exception:
+        return _pid_exists_with_kill_zero(pid)
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    except AttributeError:
+        return _pid_exists_with_kill_zero(pid)
+
+    synchronize = 0x00100000
+    process_query_limited_information = 0x1000
+    wait_timeout = 0x00000102
+
+    handle = kernel32.OpenProcess(
+        synchronize | process_query_limited_information,
+        False,
+        pid,
+    )
+    if not handle:
+        return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: process exists
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_exists_with_kill_zero(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_pid(pid: int) -> None:
+    os.kill(pid, signal.SIGTERM)
+
+
+def _kill_pid(pid: int) -> None:
+    if get_platform() == "windows":
+        os.kill(pid, signal.SIGTERM)
+        return
+    os.kill(pid, signal.SIGKILL)
+
+
 # ---------------------------------------------------------------------------
 # Job execution
 # ---------------------------------------------------------------------------
 
+
+def _format_notification(job: dict[str, Any], entry: dict[str, Any]) -> str:
+    """Build a concise notification body for a completed cron job."""
+    status = entry.get("status", "?")
+    rc = entry.get("returncode", "?")
+    lines = [
+        f"⏰ Cron job finished: {job.get('name', '?')}",
+        f"Status: {status} (rc={rc})",
+        f"Started: {entry.get('started_at', '?')}",
+        f"Ended: {entry.get('ended_at', '?')}",
+    ]
+    stdout = str(entry.get("stdout") or "").strip()
+    stderr = str(entry.get("stderr") or "").strip()
+    if stdout:
+        lines.extend(["", "Output:", stdout[-NOTIFICATION_OUTPUT_LIMIT:]])
+    if stderr:
+        lines.extend(["", "Stderr:", stderr[-NOTIFICATION_OUTPUT_LIMIT:]])
+    if not stdout and not stderr:
+        lines.extend(["", "(no output)"])
+    return "\n".join(lines)
+
+
+async def _notify_job_result(job: dict[str, Any], entry: dict[str, Any]) -> None:
+    """Deliver an optional post-run notification for a cron job."""
+    notify = job.get("notify")
+    payload = job.get("payload")
+    if not isinstance(notify, dict) and isinstance(payload, dict) and payload.get("deliver"):
+        notify = {"type": payload.get("channel"), "to": payload.get("to")}
+    if not isinstance(notify, dict):
+        return
+    notify_type = str(notify.get("type") or "").strip().lower()
+    try:
+        if notify_type in {"feishu_dm", "feishu"}:
+            from ohmo.gateway.notify import send_feishu_dm
+
+            user_open_id = str(
+                notify.get("user_open_id") or notify.get("open_id") or notify.get("to") or ""
+            ).strip()
+            if not user_open_id:
+                raise ValueError("missing notify.user_open_id")
+            workspace = notify.get("workspace")
+            await send_feishu_dm(
+                user_open_id=user_open_id,
+                content=_format_notification(job, entry),
+                workspace=str(workspace) if workspace else None,
+            )
+        elif notify_type:
+            raise ValueError(f"unsupported notify.type: {notify_type}")
+    except Exception as exc:
+        logger.error("Failed to notify cron job %r result: %s", job.get("name"), exc)
+        entry["notification_status"] = "failed"
+        entry["notification_error"] = str(exc)
+    else:
+        entry["notification_status"] = "sent"
+
+
+def _command_for_job(job: dict[str, Any]) -> str:
+    """Return the shell command used to execute a job."""
+    command = job.get("command")
+    if command:
+        return str(command)
+    payload = job.get("payload")
+    if not isinstance(payload, dict) or payload.get("kind", "agent_turn") != "agent_turn":
+        raise ValueError("cron job has no command or agent_turn payload")
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        raise ValueError("agent_turn cron job is missing payload.message")
+    cwd = str(job.get("cwd") or ".")
+    parts = ["ohmo"]
+    profile = payload.get("profile") or job.get("provider_profile")
+    if profile is None and load_gateway_config is not None:
+        profile = load_gateway_config().provider_profile
+    if profile:
+        parts.extend(["--profile", str(profile)])
+    parts.extend(
+        [
+            "--cwd",
+            cwd,
+            "--print",
+            message,
+        ]
+    )
+    return " ".join(shlex.quote(part) for part in parts)
+
+
 async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
     """Run a single cron job and return a history entry."""
     name = job["name"]
-    command = job["command"]
     cwd = Path(job.get("cwd") or ".").expanduser()
     started_at = datetime.now(timezone.utc)
+    try:
+        command = _command_for_job(job)
+    except Exception as exc:
+        entry = {
+            "name": name,
+            "command": "",
+            "started_at": started_at.isoformat(),
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "returncode": -1,
+            "status": "error",
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        mark_job_run(name, success=False)
+        await _notify_job_result(job, entry)
+        append_history(entry)
+        return entry
 
     logger.info("Executing cron job %r: %s", name, command)
     try:
@@ -183,6 +361,7 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
             "stderr": "Job timed out after 300s",
         }
         mark_job_run(name, success=False)
+        await _notify_job_result(job, entry)
         append_history(entry)
         return entry
     except SandboxUnavailableError as exc:
@@ -197,6 +376,7 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
             "stderr": str(exc),
         }
         mark_job_run(name, success=False)
+        await _notify_job_result(job, entry)
         append_history(entry)
         return entry
     except Exception as exc:
@@ -211,6 +391,7 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
             "stderr": str(exc),
         }
         mark_job_run(name, success=False)
+        await _notify_job_result(job, entry)
         append_history(entry)
         return entry
 
@@ -226,6 +407,7 @@ async def execute_job(job: dict[str, Any]) -> dict[str, Any]:
         "stderr": (stderr.decode("utf-8", errors="replace")[-2000:] if stderr else ""),
     }
     mark_job_run(name, success=success)
+    await _notify_job_result(job, entry)
     append_history(entry)
     logger.info("Job %r finished: %s (rc=%s)", name, entry["status"], process.returncode)
     return entry
@@ -262,13 +444,8 @@ async def run_scheduler_loop(*, once: bool = False) -> None:
     """Main scheduler loop.  Runs until SIGTERM or *once* is True (test mode)."""
     shutdown = asyncio.Event()
 
-    def _on_signal() -> None:
-        logger.info("Received shutdown signal")
-        shutdown.set()
-
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, _on_signal)
+    restore_signals = _install_shutdown_signal_handlers(loop, shutdown)
 
     write_pid()
     logger.info("Cron scheduler started (pid=%d, tick=%ds)", os.getpid(), TICK_INTERVAL_SECONDS)
@@ -297,8 +474,43 @@ async def run_scheduler_loop(*, once: bool = False) -> None:
             except asyncio.TimeoutError:
                 pass
     finally:
+        restore_signals()
         remove_pid()
         logger.info("Cron scheduler stopped")
+
+
+def _install_shutdown_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    shutdown: asyncio.Event,
+) -> Callable[[], None]:
+    """Install portable signal handlers and return a restore callback."""
+    previous_handlers: list[tuple[signal.Signals, Any]] = []
+
+    def _on_signal(signum: int, frame: FrameType | None) -> None:
+        del frame
+        logger.info("Received shutdown signal (%s)", signum)
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(shutdown.set)
+
+    signals: list[signal.Signals] = [signal.SIGTERM, signal.SIGINT]
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        signals.append(sigbreak)
+
+    for sig in signals:
+        try:
+            previous = signal.getsignal(sig)
+            signal.signal(sig, _on_signal)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        previous_handlers.append((sig, previous))
+
+    def _restore() -> None:
+        for sig, previous in reversed(previous_handlers):
+            with contextlib.suppress(OSError, RuntimeError, ValueError):
+                signal.signal(sig, previous)
+
+    return _restore
 
 
 # ---------------------------------------------------------------------------
@@ -318,28 +530,49 @@ def _run_daemon() -> None:
 
 
 def start_daemon() -> int:
-    """Fork and start the scheduler daemon.  Returns the child PID."""
+    """Start the scheduler daemon and return its PID."""
     existing = read_pid()
     if existing is not None:
         raise RuntimeError(f"Scheduler already running (pid={existing})")
 
-    pid = os.fork()
-    if pid > 0:
-        # Parent — wait a moment for the child to write its PID file
-        time.sleep(0.3)
-        return pid
+    process = _spawn_scheduler_process()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        pid = read_pid()
+        if pid is not None:
+            return pid
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
 
-    # Child — detach
-    os.setsid()
-    # Redirect stdio
-    devnull = os.open(os.devnull, os.O_RDWR)
-    os.dup2(devnull, 0)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
-    os.close(devnull)
+    if process.poll() is not None:
+        log_file = get_logs_dir() / "cron_scheduler.log"
+        raise RuntimeError(f"Cron scheduler failed to start; see {log_file}")
+    return process.pid
 
-    _run_daemon()
-    sys.exit(0)
+
+def _spawn_scheduler_process() -> subprocess.Popen[bytes]:
+    """Spawn a detached scheduler subprocess on Unix and Windows."""
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if get_platform() == "windows":
+        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+        if creationflags:
+            popen_kwargs["creationflags"] = creationflags
+    else:
+        popen_kwargs["start_new_session"] = True
+    return subprocess.Popen(
+        [sys.executable, "-m", "openharness.services.cron_scheduler"],
+        **popen_kwargs,
+    )
 
 
 def scheduler_status() -> dict[str, Any]:
@@ -356,3 +589,7 @@ def scheduler_status() -> dict[str, Any]:
         "log_file": str(log_path),
         "history_file": str(get_history_path()),
     }
+
+
+if __name__ == "__main__":
+    _run_daemon()
