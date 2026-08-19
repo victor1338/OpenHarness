@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
 import logging
+import subprocess
+import sys
 from types import SimpleNamespace
 from datetime import datetime
 import json
@@ -10,11 +12,13 @@ import pytest
 
 from openharness.api.client import ApiMessageCompleteEvent
 from openharness.api.usage import UsageSnapshot
+from openharness.autopilot.service import RepoAutopilotStore
 from openharness.bridge import get_bridge_manager
 from openharness.channels.bus.events import InboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.commands import CommandResult
 from openharness.commands.registry import SlashCommand, create_default_command_registry
+from openharness.config.paths import get_project_issue_file, get_project_pr_comments_file
 from openharness.config.settings import PermissionSettings, ProviderProfile, Settings
 from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolUseBlock
 from openharness.engine.query_engine import QueryEngine
@@ -28,6 +32,7 @@ from openharness.engine.stream_events import (
 from openharness.memory import add_memory_entry as add_project_memory_entry
 from openharness.memory import list_memory_files as list_project_memory_files
 from openharness.permissions import PermissionChecker, PermissionMode
+from openharness.tasks.manager import get_task_manager
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
 
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
@@ -42,7 +47,7 @@ from ohmo.gateway.runtime import (
     _sanitize_group_command_metadata,
     _sanitize_group_command_prompts,
 )
-from ohmo.gateway.service import OhmoGatewayService, gateway_status, stop_gateway_process
+from ohmo.gateway.service import OhmoGatewayService, gateway_status, start_gateway_process, stop_gateway_process
 from ohmo.group_registry import load_managed_group_record, save_managed_group_record
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.memory import list_memory_files as list_ohmo_memory_files
@@ -128,6 +133,250 @@ def test_gateway_router_separates_senders_in_same_group_without_thread():
     assert session_key_for_message(second) == "feishu:oc_shared:bob"
 
 
+@pytest.mark.asyncio
+async def test_slack_thread_messages_use_sender_scoped_router_keys(monkeypatch):
+    import sys
+    import types
+
+    def install_stub(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        monkeypatch.setitem(sys.modules, name, module)
+        return module
+
+    install_stub("slackify_markdown", slackify_markdown=lambda text: text)
+    install_stub("slack_sdk")
+    install_stub("slack_sdk.socket_mode")
+    install_stub("slack_sdk.socket_mode.request", SocketModeRequest=object)
+
+    class FakeSocketModeResponse:
+        def __init__(self, envelope_id=None):
+            self.envelope_id = envelope_id
+
+    install_stub("slack_sdk.socket_mode.response", SocketModeResponse=FakeSocketModeResponse)
+    install_stub("slack_sdk.socket_mode.websockets", SocketModeClient=object)
+    install_stub("slack_sdk.web")
+    install_stub("slack_sdk.web.async_client", AsyncWebClient=object)
+
+    from openharness.channels.impl.slack import SlackChannel
+    from openharness.config.schema import SlackConfig
+
+    class CapturingBus:
+        def __init__(self):
+            self.messages = []
+
+        async def publish_inbound(self, msg):
+            self.messages.append(msg)
+
+    class FakeSocketClient:
+        async def send_socket_mode_response(self, response):
+            return None
+
+    async def send_thread_message(channel, *, user):
+        request = SimpleNamespace(
+            type="events_api",
+            envelope_id=f"env-{user}",
+            payload={
+                "event": {
+                    "type": "app_mention",
+                    "user": user,
+                    "channel": "C_SHARED",
+                    "channel_type": "channel",
+                    "text": "<@BOT> /summary 50",
+                    "thread_ts": "1710000000.000100",
+                    "ts": f"1710000000.{user[-1]}",
+                }
+            },
+        )
+        await channel._on_socket_request(FakeSocketClient(), request)
+
+    bus = CapturingBus()
+    config = SlackConfig(
+        allow_from=["U_ALICE", "U_BOB"],
+        bot_token="xoxb-fake",
+        app_token="xapp-fake",
+        mode="socket",
+        group_policy="mention",
+        reply_in_thread=True,
+        react_emoji="eyes",
+        dm=SimpleNamespace(enabled=True, policy="allowlist", allow_from=["U_ALICE", "U_BOB"]),
+    )
+    channel = SlackChannel(config, bus)
+    channel._bot_user_id = "BOT"
+    channel._web_client = None
+
+    await send_thread_message(channel, user="U_ALICE")
+    await send_thread_message(channel, user="U_BOB")
+
+    alice, bob = bus.messages
+    assert alice.session_key_override is None
+    assert bob.session_key_override is None
+    assert alice.metadata["thread_ts"] == "1710000000.000100"
+    assert bob.metadata["thread_ts"] == "1710000000.000100"
+    assert alice.metadata["chat_type"] == "group"
+    assert bob.metadata["chat_type"] == "group"
+    assert session_key_for_message(alice) == "slack:C_SHARED:1710000000.000100:U_ALICE"
+    assert session_key_for_message(bob) == "slack:C_SHARED:1710000000.000100:U_BOB"
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_summary_does_not_restore_other_slack_thread_sender(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    alice_message = InboundMessage(
+        channel="slack",
+        sender_id="U_ALICE",
+        chat_id="C_SHARED",
+        content="hello",
+        timestamp=datetime.utcnow(),
+        metadata={"thread_ts": "1710000000.000100", "chat_type": "group"},
+    )
+    bob_message = InboundMessage(
+        channel="slack",
+        sender_id="U_BOB",
+        chat_id="C_SHARED",
+        content="/summary 50",
+        timestamp=datetime.utcnow(),
+        metadata={"thread_ts": "1710000000.000100", "chat_type": "group"},
+    )
+    alice_key = session_key_for_message(alice_message)
+    bob_key = session_key_for_message(bob_message)
+    assert alice_key != bob_key
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="test",
+        session_key=alice_key,
+        usage=UsageSnapshot(),
+        messages=[
+            ConversationMessage(
+                role="user",
+                content=[TextBlock(text="Alice private note: ALICE_PRIVATE_SUMMARY_SECRET")],
+            )
+        ],
+    )
+
+    async def fake_build_runtime(**kwargs):
+        restored = [ConversationMessage.model_validate(item) for item in (kwargs.get("restore_messages") or [])]
+
+        class FakeEngine:
+            def __init__(self):
+                self.messages = restored
+                self.total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=create_default_command_registry(),
+            cwd=str(tmp_path),
+            session_backend=None,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            hook_summary=lambda: "",
+            mcp_summary=lambda: "",
+            plugin_summary=lambda: "",
+            tool_registry=None,
+            app_state=None,
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    updates = [u async for u in pool.stream_message(bob_message, bob_key)]
+
+    assert updates[-1].kind == "final"
+    assert updates[-1].text == "/summary is only available in the local OpenHarness UI."
+    assert "ALICE_PRIVATE_SUMMARY_SECRET" not in updates[-1].text
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_blocks_registered_resume_without_listing_or_loading_other_sessions(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/resume alice-session")
+
+    assert command is not None
+    assert command.name == "resume"
+    assert command.remote_invocable is False
+
+    alice_secret = "ALICE_PRIVATE_RESUME_SECRET"
+    alice_key = "slack:C_SHARED:thread1:U_ALICE"
+    bob_key = "slack:C_SHARED:thread1:U_BOB"
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="test",
+        session_id="alice-session",
+        session_key=alice_key,
+        usage=UsageSnapshot(),
+        messages=[ConversationMessage.from_user_text(f"Alice private note: {alice_secret}")],
+    )
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            def load_messages(self, messages):
+                raise AssertionError("remote /resume must not load saved messages")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="bob-session",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=registry,
+            tool_registry=None,
+            app_state=None,
+            session_backend=None,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            hook_summary=lambda: "",
+            mcp_summary=lambda: "",
+            plugin_summary=lambda: "",
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    for payload in ("/resume", "/resume alice-session"):
+        message = InboundMessage(
+            channel="slack",
+            sender_id="U_BOB",
+            chat_id="C_SHARED",
+            content=payload,
+            timestamp=datetime.utcnow(),
+            metadata={"thread_ts": "thread1", "chat_type": "group"},
+        )
+        updates = [u async for u in pool.stream_message(message, bob_key)]
+
+        assert updates[-1].kind == "final"
+        assert updates[-1].text == "/resume is only available in the local OpenHarness UI."
+        assert "alice-session" not in updates[-1].text
+        assert alice_secret not in updates[-1].text
+
+
 def test_gateway_error_formats_claude_refresh_failure():
     exc = ValueError("Claude OAuth refresh failed: HTTP Error 400: Bad Request")
     assert "claude-login" in _format_gateway_error(exc)
@@ -173,6 +422,34 @@ def test_gateway_status_prefers_live_config_over_stale_state(tmp_path):
     assert state.running is False
     assert state.provider_profile == "codex"
     assert state.enabled_channels == ["feishu"]
+
+
+def test_start_gateway_process_uses_child_log_file_handler_without_console_duplication(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 1234
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr("ohmo.gateway.service.subprocess.Popen", fake_popen)
+
+    assert start_gateway_process(tmp_path, workspace) == 1234
+
+    args = captured["args"]
+    kwargs = captured["kwargs"]
+    assert isinstance(args, list)
+    assert args[:4] == [sys.executable, "-m", "ohmo", "gateway"]
+    assert "run" in args
+    assert "--no-console-log" in args
+    assert isinstance(kwargs, dict)
+    assert kwargs["stdout"] is kwargs["stderr"]
+    assert getattr(kwargs["stdout"], "name", "").endswith("gateway.log")
 
 
 def test_stop_gateway_process_kills_matching_workspace_processes(tmp_path, monkeypatch):
@@ -235,6 +512,75 @@ async def test_runtime_pool_restores_messages_for_private_legacy_session_key(tmp
 
     assert captured["restore_messages"] is not None
     assert bundle.session_id == "sess123"
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_blocks_registered_diff_full_without_leaking_workspace_changes(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / ".ohmo-home"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    initialize_workspace(workspace)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "OpenHarness Test"], cwd=repo, check=True)
+    changed_file = repo / "app.env"
+    changed_file.write_text("OPENHARNESS_VALUE=old\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.env"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    changed_file.write_text("OPENHARNESS_VALUE=LEAKMARK_REMOTE_DIFF_VALUE\n", encoding="utf-8")
+
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/diff full")
+    assert command is not None
+    assert command.name == "diff"
+    assert command.remote_invocable is False
+
+    class FakeEngine:
+        messages = []
+        total_usage = UsageSnapshot()
+        tool_metadata = {}
+
+        def set_system_prompt(self, prompt):
+            return None
+
+    async def fake_build_runtime(**kwargs):
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(repo),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=registry,
+            tool_registry=None,
+            app_state=None,
+            session_backend=None,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            hook_summary=lambda: "",
+            mcp_summary=lambda: "",
+            plugin_summary=lambda: "",
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=repo, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(
+        channel="slack",
+        sender_id="U_ALLOWED",
+        chat_id="C_SHARED",
+        content="/diff full",
+    )
+
+    updates = [update async for update in pool.stream_message(message, "slack:C_SHARED:U_ALLOWED")]
+
+    assert updates[-1].kind == "final"
+    assert updates[-1].text == "/diff is only available in the local OpenHarness UI."
+    assert "LEAKMARK_REMOTE_DIFF_VALUE" not in updates[-1].text
 
 
 @pytest.mark.asyncio
@@ -402,6 +748,144 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
     assert "web_fetch" in updates[1].text
     assert updates[-1].kind == "final"
     assert updates[-1].text == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_runtime_pool_stream_message_emits_media_for_generated_tool_paths(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(b"png")
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                yield ToolExecutionCompleted(
+                    tool_name="image_generation",
+                    output=f"Wrote {image_path}",
+                    metadata={"paths": [str(image_path)], "provider": "codex"},
+                )
+                yield AssistantTextDelta(text="done")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw")
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    media_updates = [u for u in updates if u.kind == "media"]
+    assert len(media_updates) == 1
+    assert media_updates[0].media == [str(image_path)]
+    assert media_updates[0].metadata["_media"] == [str(image_path)]
+    assert "已生成图片 via codex" in media_updates[0].text
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_attaches_final_reply_image_path_as_media(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(b"png")
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                yield AssistantTextDelta(text=f"已生成图片：\n```text\n{image_path}\n```")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw")
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    assert updates[-1].kind == "final"
+    assert updates[-1].media == [str(image_path)]
+    assert updates[-1].metadata["_media"] == [str(image_path)]
+    assert updates[-1].metadata["_final_media_fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_does_not_duplicate_final_reply_image_media(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(b"png")
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                yield ToolExecutionCompleted(
+                    tool_name="image_generation",
+                    output=f"Wrote {image_path}",
+                    metadata={"paths": [str(image_path)], "provider": "codex"},
+                )
+                yield AssistantTextDelta(text=f"已生成图片：\n```text\n{image_path}\n```")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw")
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    assert [u.kind for u in updates].count("media") == 1
+    assert updates[-1].kind == "final"
+    assert updates[-1].media is None
+    assert "_final_media_fallback" not in updates[-1].metadata
 
 
 @pytest.mark.asyncio
@@ -704,6 +1188,215 @@ async def test_runtime_pool_blocks_registered_bridge_spawn_without_shelling_out(
     assert {session.session_id for session in get_bridge_manager().list_sessions()} == existing_bridge_sessions
     assert marker.exists() is False
 
+
+@pytest.mark.asyncio
+async def test_runtime_pool_blocks_registered_commit_without_running_git_hooks(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "config", "user.email", "openharness-test@example.invalid"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "OpenHarness Test"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tracked = repo / "tracked.txt"
+    tracked.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    marker = repo / "remote-commit-hook-marker.txt"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\nprintf REMOTE_COMMIT_HOOK_EXEC > {marker}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    tracked.write_text("before\nremote change\n", encoding="utf-8")
+
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/commit remote requested commit")
+    assert command is not None
+    assert command.name == "commit"
+    assert command.remote_invocable is False
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(repo),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=registry,
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=repo, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(
+        channel="slack",
+        sender_id="U_ATTACKER",
+        chat_id="C_SHARED",
+        content="/commit remote requested commit",
+    )
+    updates = [u async for u in pool.stream_message(message, "slack:C_SHARED:U_ATTACKER")]
+
+    assert updates[-1].kind == "final"
+    assert updates[-1].text == "/commit is only available in the local OpenHarness UI."
+    assert marker.exists() is False
+    last_commit = subprocess.run(
+        ["git", "log", "-1", "--pretty=%s"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert last_commit == "initial"
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_blocks_registered_tasks_run_without_shelling_out(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    marker = tmp_path / "remote-tasks-marker.txt"
+    payload = f"/tasks run printf REMOTE_TASKS_EXEC > {marker}"
+    registry = create_default_command_registry()
+    command, _ = registry.lookup(payload)
+    existing_tasks = {task.id for task in get_task_manager().list_tasks()}
+
+    assert command is not None
+    assert command.name == "tasks"
+    assert command.remote_invocable is False
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=registry,
+            tool_registry=None,
+            app_state=None,
+            session_backend=None,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            hook_summary=lambda: "",
+            mcp_summary=lambda: "",
+            plugin_summary=lambda: "",
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content=payload)
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    assert updates[-1].kind == "final"
+    assert updates[-1].text == "/tasks is only available in the local OpenHarness UI."
+    assert {task.id for task in get_task_manager().list_tasks()} == existing_tasks
+    assert marker.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_blocks_project_context_commands_without_writing_files(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    initialize_workspace(workspace)
+    registry = create_default_command_registry()
+
+    for payload, expected_name in (
+        ("/issue set Remote supplied issue :: REMOTE_ISSUE_CONTEXT_POISON", "issue"),
+        ("/pr_comments add src/app.py:1 :: REMOTE_PR_COMMENT_POISON", "pr_comments"),
+    ):
+        command, _ = registry.lookup(payload)
+        assert command is not None
+        assert command.name == expected_name
+        assert command.remote_invocable is False
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(repo),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=registry,
+            tool_registry=None,
+            app_state=None,
+            session_backend=None,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            hook_summary=lambda: "",
+            mcp_summary=lambda: "",
+            plugin_summary=lambda: "",
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=repo, workspace=workspace, provider_profile="codex")
+
+    for payload, expected_denial in (
+        ("/issue set Remote supplied issue :: REMOTE_ISSUE_CONTEXT_POISON", "/issue is only available in the local OpenHarness UI."),
+        ("/pr_comments add src/app.py:1 :: REMOTE_PR_COMMENT_POISON", "/pr_comments is only available in the local OpenHarness UI."),
+    ):
+        message = InboundMessage(channel="slack", sender_id="U_ATTACKER", chat_id="C_SHARED", content=payload)
+        updates = [u async for u in pool.stream_message(message, "slack:C_SHARED:U_ATTACKER")]
+        assert updates[-1].kind == "final"
+        assert updates[-1].text == expected_denial
+
+    assert get_project_issue_file(repo).exists() is False
+    assert get_project_pr_comments_file(repo).exists() is False
 
 
 @pytest.mark.asyncio
@@ -1089,6 +1782,66 @@ def test_runtime_pool_includes_group_speaker_context():
     assert "Tang Jiabin" in text
     assert "Sender id: ou_123" in text
     assert "请帮我看一下" in text
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_publishes_media_updates():
+    bus = MessageBus()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="media",
+                text="已生成图片：generated.png",
+                media=["/tmp/generated.png"],
+                metadata={"_session_key": session_key, "_media": ["/tmp/generated.png"]},
+            )
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw"))
+        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert outbound.content == "已生成图片：generated.png"
+    assert outbound.media == ["/tmp/generated.png"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_publishes_final_media_updates():
+    bus = MessageBus()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="final",
+                text="已生成图片：generated.png",
+                media=["/tmp/generated.png"],
+                metadata={"_session_key": session_key, "_media": ["/tmp/generated.png"]},
+            )
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="draw"))
+        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+    finally:
+        bridge.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert outbound.content == "已生成图片：generated.png"
+    assert outbound.media == ["/tmp/generated.png"]
 
 
 @pytest.mark.asyncio
@@ -2049,7 +2802,14 @@ def test_runtime_pool_sanitizes_internal_group_prompt_metadata():
 async def test_runtime_pool_provider_command_refresh_uses_gateway_profile(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
-    save_gateway_config(GatewayConfig(provider_profile="kimi-anthropic"), workspace)
+    save_gateway_config(
+        GatewayConfig(
+            provider_profile="kimi-anthropic",
+            allow_remote_admin_commands=True,
+            allowed_remote_admin_commands=["provider", "model"],
+        ),
+        workspace,
+    )
     build_calls: list[dict[str, object]] = []
 
     statuses = {
@@ -2128,6 +2888,92 @@ async def test_runtime_pool_provider_command_refresh_uses_gateway_profile(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command_text,command_name",
+    [("/provider codex", "provider"), ("/model gpt-5.5", "model")],
+)
+async def test_runtime_pool_rejects_gateway_scoped_command_without_admin_opt_in(
+    tmp_path,
+    monkeypatch,
+    command_text,
+    command_name,
+):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_gateway_config(GatewayConfig(provider_profile="kimi-anthropic"), workspace)
+    build_calls: list[dict[str, object]] = []
+    handler_invocations: list[tuple[str, str]] = []
+
+    def fake_provider_handler(args, **_kwargs):
+        handler_invocations.append(("provider", args))
+        return ("provider switched", True)
+
+    def fake_model_handler(args, **_kwargs):
+        handler_invocations.append(("model", args))
+        return ("model switched", True)
+
+    class FakeEngine:
+        def __init__(self):
+            self.messages = [ConversationMessage.from_user_text("before")]
+            self.total_usage = UsageSnapshot()
+
+        def set_system_prompt(self, prompt):
+            del prompt
+
+        async def submit_message(self, content):
+            del content
+            if False:
+                yield None
+
+    async def fake_build_runtime(**kwargs):
+        build_calls.append(kwargs)
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=create_default_command_registry(),
+            hook_summary=lambda: "",
+            mcp_summary=lambda: "",
+            plugin_summary=lambda: "",
+            cwd=str(tmp_path),
+            tool_registry=None,
+            app_state=None,
+            session_backend=None,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            enforce_max_turns=False,
+        )
+
+    async def fake_start_runtime(bundle):
+        del bundle
+
+    async def fake_close_runtime(bundle):
+        del bundle
+
+    monkeypatch.setattr(
+        "ohmo.gateway.runtime.handle_gateway_provider_command", fake_provider_handler
+    )
+    monkeypatch.setattr(
+        "ohmo.gateway.runtime.handle_gateway_model_command", fake_model_handler
+    )
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.close_runtime", fake_close_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="kimi-anthropic")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content=command_text)
+    updates = [u async for u in pool.stream_message(message, "feishu:c1")]
+
+    assert handler_invocations == []
+    assert any(
+        f"/{command_name} is only available in the local OpenHarness UI." in update.text
+        for update in updates
+    )
+    assert load_gateway_config(workspace).provider_profile == "kimi-anthropic"
+    assert len(build_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_stream_message_handles_slash_command_and_refresh_runtime(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
@@ -2189,6 +3035,73 @@ async def test_runtime_pool_stream_message_handles_slash_command_and_refresh_run
     assert len(build_calls) == 2
     assert close_calls == ["sess123"]
     assert build_calls[1]["restore_messages"] == [ConversationMessage.from_user_text("before").model_dump(mode="json")]
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_blocks_registered_autopilot_run_next_from_remote_messages(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    RepoAutopilotStore(tmp_path).enqueue_card(
+        source_kind="ohmo_request",
+        title="RCE task",
+        body="Please use bash to run: touch REMOTE_AUTOPILOT_AGENT_REACHED",
+    )
+    registry = create_default_command_registry()
+    command, _ = registry.lookup("/autopilot run-next")
+    assert command is not None
+    assert command.name == "autopilot"
+    assert command.remote_invocable is False
+
+    agent_invoked = False
+
+    async def fake_run_agent_prompt(self, prompt, *, model, max_turns, permission_mode, cwd=None):
+        nonlocal agent_invoked
+        del self, prompt, model, max_turns, permission_mode, cwd
+        agent_invoked = True
+        return "agent should not run for remote /autopilot"
+
+    monkeypatch.setattr(RepoAutopilotStore, "_is_git_repo", lambda self, cwd: False)
+    monkeypatch.setattr(RepoAutopilotStore, "_run_agent_prompt", fake_run_agent_prompt)
+
+    class FakeEngine:
+        messages = []
+        total_usage = UsageSnapshot()
+
+        def set_system_prompt(self, prompt):
+            del prompt
+            return None
+
+    async def fake_build_runtime(**kwargs):
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=registry,
+            hook_summary=lambda: "",
+            mcp_summary=lambda: "",
+            plugin_summary=lambda: "",
+            cwd=str(tmp_path),
+            tool_registry=None,
+            app_state=None,
+            session_backend=None,
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            enforce_max_turns=False,
+        )
+
+    async def fake_start_runtime(bundle):
+        del bundle
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="slack", sender_id="u1", chat_id="c1", content="/autopilot run-next")
+    updates = [u async for u in pool.stream_message(message, "slack:c1:u1")]
+
+    assert updates[-1].text == "/autopilot is only available in the local OpenHarness UI."
+    assert agent_invoked is False
 
 
 @pytest.mark.asyncio
