@@ -78,6 +78,17 @@ def _convert_messages_to_codex(messages: list[ConversationMessage]) -> list[dict
     result: list[dict[str, Any]] = []
     for msg in messages:
         if msg.role == "user":
+            # Responses API requires function_call_output items to appear before
+            # any following user input.  A ConversationMessage can contain both
+            # tool results and user text, so emit the tool outputs first to keep
+            # every prior function_call immediately satisfied.
+            for block in msg.content:
+                if isinstance(block, ToolResultBlock):
+                    result.append({
+                        "type": "function_call_output",
+                        "call_id": block.tool_use_id,
+                        "output": block.content,
+                    })
             user_content: list[dict[str, Any]] = []
             for block in msg.content:
                 if isinstance(block, TextBlock) and block.text.strip():
@@ -89,13 +100,6 @@ def _convert_messages_to_codex(messages: list[ConversationMessage]) -> list[dict
                     })
             if user_content:
                 result.append({"role": "user", "content": user_content})
-            for block in msg.content:
-                if isinstance(block, ToolResultBlock):
-                    result.append({
-                        "type": "function_call_output",
-                        "call_id": block.tool_use_id,
-                        "output": block.content,
-                    })
             continue
 
         assistant_text = "".join(block.text for block in msg.content if isinstance(block, TextBlock))
@@ -127,6 +131,15 @@ def _convert_tools_to_codex(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
         }
         for tool in tools
     ]
+
+
+def _normalize_reasoning_effort(effort: str | None) -> str | None:
+    normalized = (effort or "").strip().lower()
+    if normalized == "max":
+        return "xhigh"
+    if normalized in {"low", "medium", "high", "xhigh"}:
+        return normalized
+    return None
 
 
 def _usage_from_response(response: dict[str, Any]) -> UsageSnapshot:
@@ -251,6 +264,9 @@ class CodexApiClient:
         }
         if request.tools:
             body["tools"] = _convert_tools_to_codex(request.tools)
+        effort = _normalize_reasoning_effort(request.effort)
+        if effort:
+            body["reasoning"] = {"effort": effort}
 
         content: list[TextBlock | ToolUseBlock] = []
         current_text_parts: list[str] = []
