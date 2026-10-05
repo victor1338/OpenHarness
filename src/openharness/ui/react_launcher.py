@@ -83,6 +83,7 @@ def build_backend_command(
     cwd: str | None = None,
     model: str | None = None,
     max_turns: int | None = None,
+    effort: str | None = None,
     base_url: str | None = None,
     system_prompt: str | None = None,
     api_key: str | None = None,
@@ -97,6 +98,8 @@ def build_backend_command(
         command.extend(["--model", model])
     if max_turns is not None:
         command.extend(["--max-turns", str(max_turns)])
+    if effort:
+        command.extend(["--effort", effort])
     if base_url:
         command.extend(["--base-url", base_url])
     if system_prompt:
@@ -116,6 +119,7 @@ async def launch_react_tui(
     cwd: str | None = None,
     model: str | None = None,
     max_turns: int | None = None,
+    effort: str | None = None,
     base_url: str | None = None,
     system_prompt: str | None = None,
     api_key: str | None = None,
@@ -148,6 +152,7 @@ async def launch_react_tui(
                 cwd=cwd or str(Path.cwd()),
                 model=model,
                 max_turns=max_turns,
+                effort=effort,
                 base_url=base_url,
                 system_prompt=system_prompt,
                 api_key=api_key,
