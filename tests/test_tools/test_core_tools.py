@@ -57,6 +57,76 @@ async def test_file_write_read_and_edit(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_file_write_requests_edit_approval_and_reports_diff_stats(tmp_path: Path):
+    approvals: list[tuple[str, str, int, int]] = []
+
+    async def _approve(path: str, diff: str, added: int, removed: int) -> str:
+        approvals.append((path, diff, added, removed))
+        return "once"
+
+    result = await FileWriteTool().execute(
+        FileWriteToolInput(path="notes.txt", content="one\ntwo\n"),
+        ToolExecutionContext(cwd=tmp_path, metadata={"edit_approval_prompt": _approve}),
+    )
+
+    assert result.is_error is False
+    assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "one\ntwo\n"
+    assert len(approvals) == 1
+    path, diff, added, removed = approvals[0]
+    assert path == str(tmp_path / "notes.txt")
+    assert added == 2
+    assert removed == 0
+    assert "@@" in diff
+    assert "+one" in diff
+    assert "+two" in diff
+    assert "\033[32m+2\033[0m" in result.output
+    assert "\033[31m-0\033[0m" in result.output
+
+
+@pytest.mark.asyncio
+async def test_file_write_rejection_does_not_create_parent_directories(tmp_path: Path):
+    async def _reject(path: str, diff: str, added: int, removed: int) -> str:
+        del path, diff, added, removed
+        return "reject"
+
+    result = await FileWriteTool().execute(
+        FileWriteToolInput(path="nested/notes.txt", content="draft\n"),
+        ToolExecutionContext(cwd=tmp_path, metadata={"edit_approval_prompt": _reject}),
+    )
+
+    assert result.is_error is True
+    assert "Write rejected by user" in result.output
+    assert not (tmp_path / "nested").exists()
+
+
+@pytest.mark.asyncio
+async def test_file_edit_rejects_when_edit_approval_denied(tmp_path: Path):
+    target = tmp_path / "notes.txt"
+    target.write_text("one\ntwo\n", encoding="utf-8")
+    approvals: list[tuple[str, str, int, int]] = []
+
+    async def _reject(path: str, diff: str, added: int, removed: int) -> str:
+        approvals.append((path, diff, added, removed))
+        return "reject"
+
+    result = await FileEditTool().execute(
+        FileEditToolInput(path="notes.txt", old_str="two", new_str="TWO"),
+        ToolExecutionContext(cwd=tmp_path, metadata={"edit_approval_prompt": _reject}),
+    )
+
+    assert result.is_error is True
+    assert "Edit rejected by user" in result.output
+    assert target.read_text(encoding="utf-8") == "one\ntwo\n"
+    assert len(approvals) == 1
+    path, diff, added, removed = approvals[0]
+    assert path == str(target)
+    assert added == 1
+    assert removed == 1
+    assert "-two" in diff
+    assert "+TWO" in diff
+
+
+@pytest.mark.asyncio
 async def test_glob_and_grep(tmp_path: Path):
     context = ToolExecutionContext(cwd=tmp_path)
     (tmp_path / "a.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
@@ -304,13 +374,19 @@ async def test_cron_and_remote_trigger_tools(tmp_path: Path, monkeypatch):
     context = ToolExecutionContext(cwd=tmp_path)
 
     create_result = await CronCreateTool().execute(
-        CronCreateToolInput(name="nightly", schedule="0 0 * * *", command="printf 'CRON_OK'"),
+        CronCreateToolInput(
+            name="nightly",
+            schedule="0 0 * * *",
+            command="printf 'CRON_OK'",
+            notify={"type": "feishu_dm", "user_open_id": "ou_test"},
+        ),
         context,
     )
     assert create_result.is_error is False
 
     list_result = await CronListTool().execute(CronListToolInput(), context)
     assert "nightly" in list_result.output
+    assert "feishu_dm" in list_result.output
 
     trigger_result = await RemoteTriggerTool().execute(
         RemoteTriggerToolInput(name="nightly"),
@@ -324,3 +400,26 @@ async def test_cron_and_remote_trigger_tools(tmp_path: Path, monkeypatch):
         context,
     )
     assert delete_result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_cron_create_agent_turn_payload(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    context = ToolExecutionContext(cwd=tmp_path)
+
+    create_result = await CronCreateTool().execute(
+        CronCreateToolInput(
+            name="daily-summary",
+            schedule="0 18 * * *",
+            timezone="Asia/Hong_Kong",
+            message="check GitHub",
+            payload={"deliver": True, "channel": "feishu", "to": "ou_test"},
+        ),
+        context,
+    )
+    assert create_result.is_error is False
+
+    list_result = await CronListTool().execute(CronListToolInput(), context)
+    assert "daily-summary" in list_result.output
+    assert "Asia/Hong_Kong" in list_result.output
+    assert "payload: agent_turn -> feishu:ou_test" in list_result.output
