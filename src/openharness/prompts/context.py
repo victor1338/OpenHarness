@@ -12,8 +12,11 @@ from openharness.config.paths import (
 )
 from openharness.config.settings import Settings
 from openharness.coordinator.coordinator_mode import get_coordinator_system_prompt, is_coordinator_mode
-from openharness.memory import find_relevant_memories, load_memory_prompt
+from openharness.memory import load_memory_prompt
+from openharness.memory.relevance import format_relevant_memories, select_relevant_memories
+from openharness.memory.usage import mark_memory_used
 from openharness.personalization.rules import load_local_rules
+from openharness.permissions.modes import PermissionMode
 from openharness.prompts.claudemd import load_claude_md_prompt
 from openharness.prompts.system_prompt import build_system_prompt
 from openharness.skills.loader import load_skill_registry
@@ -74,6 +77,28 @@ def _build_delegation_section() -> str:
     )
 
 
+def _build_permission_mode_section(settings: Settings) -> str:
+    """Build current permission-mode guidance for the model."""
+    mode = settings.permission.mode
+    if mode == PermissionMode.PLAN:
+        guidance = (
+            "Plan mode is enabled. Treat this session as read-only planning and analysis. "
+            "Do not call mutating tools such as file writes, edits, package installs, "
+            "state-changing shell commands, or task-spawning actions unless the user exits plan mode."
+        )
+    elif mode == PermissionMode.FULL_AUTO:
+        guidance = (
+            "Full-auto permission mode is enabled. You may use mutating tools when they are necessary "
+            "for the user's request, while still keeping changes scoped and intentional."
+        )
+    else:
+        guidance = (
+            "Default permission mode is enabled. Read-only tools can run directly; mutating tools "
+            "may require explicit user approval."
+        )
+    return f"# Current Permission Mode\n{guidance}"
+
+
 def build_runtime_system_prompt(
     settings: Settings,
     *,
@@ -91,6 +116,8 @@ def build_runtime_system_prompt(
 
     if not is_coordinator_mode() and settings.system_prompt is None:
         sections[0] = build_system_prompt(cwd=str(cwd))
+
+    sections.append(_build_permission_mode_section(settings))
 
     if settings.fast_mode:
         sections.append(
@@ -138,29 +165,23 @@ def build_runtime_system_prompt(
         memory_section = load_memory_prompt(
             cwd,
             max_entrypoint_lines=settings.memory.max_entrypoint_lines,
+            max_entrypoint_bytes=settings.memory.max_entrypoint_bytes,
         )
         if memory_section:
             sections.append(memory_section)
 
         if latest_user_prompt:
-            relevant = find_relevant_memories(
+            relevant = select_relevant_memories(
                 latest_user_prompt,
                 cwd,
                 max_results=settings.memory.max_files,
             )
             if relevant:
-                lines = ["# Relevant Memories"]
-                for header in relevant:
-                    content = header.path.read_text(encoding="utf-8", errors="replace").strip()
-                    lines.extend(
-                        [
-                            "",
-                            f"## {header.path.name}",
-                            "```md",
-                            content[:8000],
-                            "```",
-                        ]
-                    )
-                sections.append("\n".join(lines))
+                try:
+                    headers = [item.header for item in relevant]
+                    mark_memory_used(cwd, headers, memory_dir=headers[0].path.parent)
+                except OSError:
+                    pass
+                sections.append(format_relevant_memories(relevant))
 
     return "\n\n".join(section for section in sections if section.strip())
