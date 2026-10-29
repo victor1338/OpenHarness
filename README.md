@@ -642,6 +642,22 @@ Use `/skills` to list loaded skills with their source and path. User-invocable s
 
 **Compatible with [anthropics/skills](https://github.com/anthropics/skills)** — use the `SKILL.md` directory layout above.
 
+### 🌐 Web search and proxy settings
+
+Built-in `web_search` uses DuckDuckGo HTML search by default. In regions where that endpoint is unreachable, point OpenHarness at a trusted public HTML search endpoint or your own SearXNG instance:
+
+```bash
+export OPENHARNESS_WEB_SEARCH_URL="https://your-searxng.example/search"
+```
+
+`web_search` and `web_fetch` keep `trust_env=False` for SSRF safety, so they do not automatically inherit `HTTP_PROXY` / `HTTPS_PROXY`. If you need a proxy, opt in with an OpenHarness-specific variable:
+
+```bash
+export OPENHARNESS_WEB_PROXY="http://127.0.0.1:7890"
+```
+
+The proxy URL must be HTTP/HTTPS and cannot contain embedded credentials.
+
 ### 🔌 Plugin System
 
 **Compatible with [claude-code plugins](https://github.com/anthropics/claude-code/tree/main/plugins)**. Tested with 12 official plugins:
