@@ -173,6 +173,39 @@ test('keeps forward delete behavior when cursor is inside the line', async () =>
 	}
 });
 
+test('ignores ctrl+v so the app can attach clipboard images', async () => {
+	const stdin = createTestStdin();
+	const stdout = createTestStdout();
+	let currentValue = '';
+
+	const instance = render(<PromptHarness onInputChange={(value) => {
+		currentValue = value;
+	}} />, {
+		stdin: stdin as unknown as NodeJS.ReadStream & {fd: 0},
+		stdout: stdout as unknown as NodeJS.WriteStream,
+		debug: true,
+		patchConsole: false,
+	});
+	const exitPromise = instance.waitUntilExit();
+
+	try {
+		await nextLoopTurn();
+
+		await sendKey(stdin, Buffer.from([0x16]));
+		await nextLoopTurn();
+		assert.equal(currentValue, '');
+
+		await sendKey(stdin, 'v');
+		await waitForValue(() => currentValue, 'v');
+	} finally {
+		instance.unmount();
+		await exitPromise;
+		instance.cleanup();
+		stdin.destroy();
+		stdout.destroy();
+	}
+});
+
 test('accepts explicit /stop submission while busy', async () => {
 	const stdin = createTestStdin();
 	const stdout = createTestStdout();
