@@ -405,6 +405,7 @@ def _build_dry_run_preview(
     api_key: str | None,
     api_format: str | None,
     permission_mode: str | None,
+    effort: str | None = None,
 ) -> dict[str, object]:
     from openharness.api.provider import auth_status, detect_provider
     from openharness.commands import create_default_command_registry
@@ -425,6 +426,7 @@ def _build_dry_run_preview(
         api_key=api_key,
         api_format=api_format,
         permission_mode=permission_mode,
+        effort=effort,
     )
     provider = detect_provider(settings)
     auth = auth_status(settings)
@@ -766,6 +768,7 @@ mcp_app = typer.Typer(name="mcp", help="Manage MCP servers")
 plugin_app = typer.Typer(name="plugin", help="Manage plugins")
 auth_app = typer.Typer(name="auth", help="Manage authentication")
 provider_app = typer.Typer(name="provider", help="Manage provider profiles")
+config_app = typer.Typer(name="config", help="Show or update settings")
 cron_app = typer.Typer(name="cron", help="Manage cron scheduler and jobs")
 autopilot_app = typer.Typer(name="autopilot", help="Manage repo autopilot")
 
@@ -773,6 +776,7 @@ app.add_typer(mcp_app)
 app.add_typer(plugin_app)
 app.add_typer(auth_app)
 app.add_typer(provider_app)
+app.add_typer(config_app)
 app.add_typer(cron_app)
 app.add_typer(autopilot_app)
 
@@ -930,8 +934,20 @@ def cron_list_cmd() -> None:
             last = last[:19]  # trim to readable datetime
         last_status = job.get("last_status", "")
         status_indicator = f" [{last_status}]" if last_status else ""
-        print(f"  [{enabled}] {job['name']}  {job.get('schedule', '?')}")
-        print(f"        cmd: {job['command']}")
+        timezone = f" ({job['timezone']})" if job.get("timezone") else ""
+        print(f"  [{enabled}] {job['name']}  {job.get('schedule', '?')}{timezone}")
+        print(f"        cmd: {job.get('command') or '(agent_turn)'}")
+        payload = job.get("payload")
+        if isinstance(payload, dict):
+            print(
+                f"        payload: {payload.get('kind', 'agent_turn')} -> "
+                f"{payload.get('channel', '?')}:{payload.get('to', '?')}"
+            )
+        notify = job.get("notify")
+        if isinstance(notify, dict):
+            notify_type = notify.get("type", "?")
+            target = notify.get("user_open_id") or notify.get("open_id") or notify.get("chat_id") or "?"
+            print(f"        notify: {notify_type} -> {target}")
         print(f"        last: {last}{status_indicator}  next: {job.get('next_run', 'n/a')[:19]}")
 
 
@@ -1953,6 +1969,72 @@ def auth_copilot_logout() -> None:
     print("Copilot authentication cleared.")
 
 
+# ---- config subcommands ----
+
+
+def _config_resolve_target(settings: object, key: str) -> tuple[object, str]:
+    target = settings
+    parts = key.split(".")
+    for part in parts[:-1]:
+        if not hasattr(target, part):
+            raise KeyError(key)
+        target = getattr(target, part)
+    leaf = parts[-1]
+    if not hasattr(target, leaf):
+        raise KeyError(key)
+    return target, leaf
+
+
+def _config_coerce_value(current: object, raw: str) -> object:
+    if isinstance(current, bool):
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"Invalid boolean value: {raw}")
+    if isinstance(current, int) and not isinstance(current, bool):
+        return int(raw)
+    if isinstance(current, float):
+        return float(raw)
+    if isinstance(current, list):
+        return [entry.strip() for entry in raw.split(",") if entry.strip()]
+    return raw
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Print the resolved settings JSON."""
+    from openharness.commands.registry import _settings_json_for_display
+    from openharness.config.settings import load_settings
+
+    print(_settings_json_for_display(load_settings()), flush=True)
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="Setting key, including dotted nested keys"),
+    value: str = typer.Argument(..., help="Value to store"),
+) -> None:
+    """Persist one setting in ~/.openharness/settings.json."""
+    from openharness.config.settings import load_settings, save_settings
+
+    settings = load_settings()
+    try:
+        target, leaf = _config_resolve_target(settings, key)
+    except KeyError:
+        print(f"Unknown config key: {key}", file=sys.stderr)
+        raise typer.Exit(1)
+    try:
+        coerced = _config_coerce_value(getattr(target, leaf), value)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
+    setattr(target, leaf, coerced)
+    save_settings(settings)
+    print(f"Updated {key}", flush=True)
+
+
 # ---- provider subcommands ----
 
 
@@ -2139,7 +2221,7 @@ def main(
     effort: str | None = typer.Option(
         None,
         "--effort",
-        help="Effort level for the session (low, medium, high, max)",
+        help="Effort level for the session (low, medium, high, xhigh/max)",
         rich_help_panel="Model & Effort",
     ),
     verbose: bool = typer.Option(
@@ -2334,6 +2416,7 @@ def main(
             api_key=api_key,
             api_format=api_format,
             permission_mode=permission_mode,
+            effort=effort,
         )
         effective_output_format = output_format or "text"
         if effective_output_format == "text":
@@ -2407,6 +2490,7 @@ def main(
                 restore_tool_metadata=session_data.get("tool_metadata"),
                 permission_mode=permission_mode,
                 api_format=api_format,
+                effort=effort,
             )
         )
         return
@@ -2429,6 +2513,7 @@ def main(
                 api_format=api_format,
                 permission_mode=permission_mode,
                 max_turns=max_turns,
+                effort=effort,
             )
         )
         return
@@ -2444,6 +2529,7 @@ def main(
                 api_key=api_key,
                 api_format=api_format,
                 permission_mode=permission_mode,
+                effort=effort,
             )
         )
         return
@@ -2460,5 +2546,6 @@ def main(
             api_key=api_key,
             api_format=api_format,
             permission_mode=permission_mode,
+            effort=effort,
         )
     )
