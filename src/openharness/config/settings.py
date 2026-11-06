@@ -63,8 +63,15 @@ class MemorySettings(BaseModel):
     enabled: bool = True
     max_files: int = 5
     max_entrypoint_lines: int = 200
+    max_entrypoint_bytes: int = 25_000
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
+    auto_extract_enabled: bool = False
+    auto_extract_max_records: int = 3
+    session_memory_enabled: bool = True
+    auto_dream_enabled: bool = False
+    auto_dream_min_hours: float = 24.0
+    auto_dream_min_sessions: int = 5
 
 
 class SandboxNetworkSettings(BaseModel):
@@ -104,6 +111,14 @@ class SandboxSettings(BaseModel):
     network: SandboxNetworkSettings = Field(default_factory=SandboxNetworkSettings)
     filesystem: SandboxFilesystemSettings = Field(default_factory=SandboxFilesystemSettings)
     docker: DockerSandboxSettings = Field(default_factory=DockerSandboxSettings)
+
+
+class WebSettings(BaseModel):
+    """Outbound web tool configuration."""
+
+    proxy: str | None = None
+    resolution_mode: str = "auto"
+    synthetic_dns_cidrs: list[str] = Field(default_factory=list)
 
 
 class ProviderProfile(BaseModel):
@@ -363,6 +378,30 @@ def auth_source_uses_api_key(auth_source: str) -> bool:
     return auth_source.endswith("_api_key")
 
 
+def auth_source_env_var_candidates(auth_source: str) -> tuple[str, ...]:
+    """Return env vars to probe for an auth source in precedence order."""
+    mapping = {
+        "anthropic_api_key": ("OPENHARNESS_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+        "openai_api_key": ("OPENHARNESS_OPENAI_API_KEY", "OPENAI_API_KEY"),
+        "dashscope_api_key": ("OPENHARNESS_DASHSCOPE_API_KEY", "DASHSCOPE_API_KEY"),
+        "moonshot_api_key": ("OPENHARNESS_MOONSHOT_API_KEY", "MOONSHOT_API_KEY"),
+        "gemini_api_key": ("OPENHARNESS_GEMINI_API_KEY", "GEMINI_API_KEY"),
+        "minimax_api_key": ("OPENHARNESS_MINIMAX_API_KEY", "MINIMAX_API_KEY"),
+        "nvidia_api_key": ("OPENHARNESS_NVIDIA_API_KEY", "NVIDIA_API_KEY"),
+        "modelscope_api_key": ("OPENHARNESS_MODELSCOPE_API_KEY", "MODELSCOPE_API_KEY"),
+    }
+    return mapping.get(auth_source, ())
+
+
+def resolve_auth_env_value(auth_source: str) -> tuple[str, str] | None:
+    """Return the first configured env var/value pair for an auth source."""
+    for env_var in auth_source_env_var_candidates(auth_source):
+        env_value = os.environ.get(env_var, "")
+        if env_value:
+            return env_var, env_value
+    return None
+
+
 def credential_storage_provider_name(profile_name: str, profile: ProviderProfile) -> str:
     """Return the storage namespace used for this profile's credential.
 
@@ -467,6 +506,37 @@ def _profile_from_flat_settings(settings: "Settings") -> tuple[str, ProviderProf
     return name, profile
 
 
+class ImageGenerationConfig(BaseModel):
+    """Configuration for the image_generation tool."""
+
+    provider: str = "auto"
+    model: str = "gpt-image-2"
+    api_key: str = ""
+    base_url: str = ""
+    codex_model: str = "gpt-5.4"
+    codex_base_url: str = ""
+
+    @classmethod
+    def from_env(cls) -> "ImageGenerationConfig":
+        """Load image generation config from environment variables."""
+        return cls(
+            provider=os.environ.get("OPENHARNESS_IMAGE_GENERATION_PROVIDER", "auto").strip()
+            or "auto",
+            model=os.environ.get("OPENHARNESS_IMAGE_GENERATION_MODEL", "gpt-image-2").strip()
+            or "gpt-image-2",
+            api_key=os.environ.get("OPENHARNESS_IMAGE_GENERATION_API_KEY", "").strip(),
+            base_url=os.environ.get("OPENHARNESS_IMAGE_GENERATION_BASE_URL", "").strip(),
+            codex_model=os.environ.get("OPENHARNESS_IMAGE_GENERATION_CODEX_MODEL", "gpt-5.4").strip()
+            or "gpt-5.4",
+            codex_base_url=os.environ.get("OPENHARNESS_IMAGE_GENERATION_CODEX_BASE_URL", "").strip(),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        """Return True when either a key provider or Codex provider is selected."""
+        return bool(self.api_key or self.provider in {"auto", "codex"})
+
+
 class VisionModelConfig(BaseModel):
     """Configuration for the vision model used by the image_to_text tool.
 
@@ -516,6 +586,7 @@ class Settings(BaseModel):
     hooks: dict[str, list[HookDefinition]] = Field(default_factory=dict)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
+    web: WebSettings = Field(default_factory=WebSettings)
     enabled_plugins: dict[str, bool] = Field(default_factory=dict)
     allow_project_plugins: bool = False
     allow_project_skills: bool = True
@@ -537,6 +608,9 @@ class Settings(BaseModel):
     # Vision model (image-to-text fallback)
     vision: VisionModelConfig = Field(default_factory=VisionModelConfig)
 
+    # Image generation model
+    image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
+
     def merged_profiles(self) -> dict[str, ProviderProfile]:
         """Return the saved profiles merged over the built-in catalog."""
         merged = default_provider_profiles()
@@ -555,7 +629,7 @@ class Settings(BaseModel):
     def resolve_profile(self, name: str | None = None) -> tuple[str, ProviderProfile]:
         """Return the active provider profile."""
         profiles = self.merged_profiles()
-        profile_name = (name or self.active_profile or "").strip() or "claude-api"
+        profile_name = (name or self.active_profile or os.environ.get("OPENHARNESS_PROFILE") or "").strip() or "claude-api"
         if profile_name not in profiles:
             fallback_name, fallback = _profile_from_flat_settings(self)
             profiles[fallback_name] = fallback
@@ -592,9 +666,15 @@ class Settings(BaseModel):
         directly before the profile layer is used everywhere.
         """
         profile_name, profile = self.resolve_profile()
-        next_provider = (self.provider or "").strip() or profile.provider
-        next_api_format = (self.api_format or "").strip() or profile.api_format
-        next_base_url = self.base_url if self.base_url is not None else profile.base_url
+        profile_from_env = bool(os.environ.get("OPENHARNESS_PROFILE"))
+        flat_profile_fields_match_profile = profile_from_env or (
+            (self.provider or "").strip() == profile.provider
+            and (self.api_format or "").strip() == profile.api_format
+            and self.base_url == profile.base_url
+        )
+        next_provider = profile.provider if flat_profile_fields_match_profile else (self.provider or "").strip() or profile.provider
+        next_api_format = profile.api_format if flat_profile_fields_match_profile else (self.api_format or "").strip() or profile.api_format
+        next_base_url = profile.base_url if flat_profile_fields_match_profile else (self.base_url if self.base_url is not None else profile.base_url)
         next_context_window_tokens = (
             self.context_window_tokens
             if self.context_window_tokens is not None
@@ -665,19 +745,15 @@ class Settings(BaseModel):
         if self.api_key:
             return self.api_key
 
-        env_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if env_key:
-            return env_key
-
-        # Also check OPENAI_API_KEY for openai-format providers
-        openai_key = os.environ.get("OPENAI_API_KEY", "")
-        if openai_key:
-            return openai_key
+        env_resolved = resolve_auth_env_value(profile.auth_source)
+        if env_resolved:
+            _, env_value = env_resolved
+            return env_value
 
         raise ValueError(
-            "No API key found. Set ANTHROPIC_API_KEY (or OPENAI_API_KEY for openai-format "
-            "providers) environment variable, or configure api_key in "
-            "~/.openharness/settings.json"
+            "No API key found. Set an OPENHARNESS_* provider API key "
+            "(preferred) or the matching native provider environment variable, "
+            "or configure api_key in ~/.openharness/settings.json"
         )
 
     def resolve_auth(self) -> ResolvedAuth:
@@ -686,6 +762,15 @@ class Settings(BaseModel):
         provider = profile.provider.strip()
         auth_source = profile.auth_source.strip() or default_auth_source_for_provider(provider, profile.api_format)
         if auth_source in {"codex_subscription", "claude_subscription"}:
+            env_auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+            if auth_source == "claude_subscription" and env_auth_token:
+                return ResolvedAuth(
+                    provider=provider,
+                    auth_kind="oauth",
+                    value=env_auth_token,
+                    source="env:ANTHROPIC_AUTH_TOKEN",
+                    state="configured",
+                )
             from openharness.auth.external import (
                 is_third_party_anthropic_endpoint,
                 load_external_credential,
@@ -744,25 +829,16 @@ class Settings(BaseModel):
 
         storage_provider = credential_storage_provider_name(profile_name, profile)
 
-        env_var = {
-            "anthropic_api_key": "ANTHROPIC_API_KEY",
-            "openai_api_key": "OPENAI_API_KEY",
-            "dashscope_api_key": "DASHSCOPE_API_KEY",
-            "moonshot_api_key": "MOONSHOT_API_KEY",
-            "minimax_api_key": "MINIMAX_API_KEY",
-            "nvidia_api_key": "NVIDIA_API_KEY",
-            "modelscope_api_key": "MODELSCOPE_API_KEY",
-        }.get(auth_source)
-        if env_var:
-            env_value = os.environ.get(env_var, "")
-            if env_value:
-                return ResolvedAuth(
-                    provider=provider or storage_provider,
-                    auth_kind="api_key",
-                    value=env_value,
-                    source=f"env:{env_var}",
-                    state="configured",
-                )
+        env_resolved = resolve_auth_env_value(auth_source)
+        if env_resolved:
+            env_var, env_value = env_resolved
+            return ResolvedAuth(
+                provider=provider or storage_provider,
+                auth_kind="api_key",
+                value=env_value,
+                source=f"env:{env_var}",
+                state="configured",
+            )
 
         explicit_key = "" if profile.credential_slot else self.api_key
         if explicit_key:
@@ -792,10 +868,25 @@ class Settings(BaseModel):
     def merge_cli_overrides(self, **overrides: Any) -> Settings:
         """Return a new Settings with CLI overrides applied (non-None values only)."""
         updates = {k: v for k, v in overrides.items() if v is not None}
+        permission_mode = updates.pop("permission_mode", None)
+
+        def apply_permission_mode(settings: Settings) -> Settings:
+            if permission_mode is None:
+                return settings
+            return settings.model_copy(
+                update={
+                    "permission": settings.permission.model_copy(
+                        update={"mode": PermissionMode(str(permission_mode))}
+                    )
+                }
+            )
+
         # Strip ANSI escape sequences from model name if present
         if "model" in updates and isinstance(updates["model"], str):
             updates["model"] = strip_ansi_escape_sequences(updates["model"])
-        merged = self.model_copy(update=updates)
+        if "effort" in updates and isinstance(updates["effort"], str):
+            updates["effort"] = "xhigh" if updates["effort"].strip().lower() == "max" else updates["effort"].strip().lower()
+        merged = apply_permission_mode(self.model_copy(update=updates))
         if not updates:
             return merged
         profile_keys = {
@@ -812,8 +903,25 @@ class Settings(BaseModel):
         profile_updates = profile_keys.intersection(updates)
         if not profile_updates:
             return merged
-        if profile_updates.issubset({"active_profile"}):
-            return merged.materialize_active_profile()
+        if "active_profile" in profile_updates:
+            switch_updates = {
+                key: value
+                for key, value in updates.items()
+                if key not in profile_keys or key in {"active_profile", "profiles"}
+            }
+            switched = apply_permission_mode(self.model_copy(update=switch_updates)).materialize_active_profile()
+            remaining_profile_updates = {
+                key: value
+                for key, value in updates.items()
+                if key in profile_keys and key not in {"active_profile", "profiles"}
+            }
+            if not remaining_profile_updates:
+                return switched
+            return (
+                switched.model_copy(update=remaining_profile_updates)
+                .sync_active_profile_from_flat_fields()
+                .materialize_active_profile()
+            )
         return merged.sync_active_profile_from_flat_fields().materialize_active_profile()
 
 
@@ -871,15 +979,23 @@ def _apply_env_overrides(settings: Settings) -> Settings:
     if auto_compact_threshold_tokens:
         updates["auto_compact_threshold_tokens"] = int(auto_compact_threshold_tokens)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if api_key:
+    provider = os.environ.get("OPENHARNESS_PROVIDER")
+    api_format = os.environ.get("OPENHARNESS_API_FORMAT")
+    env_auth_source = active_profile.auth_source
+    if provider or api_format:
+        env_auth_source = default_auth_source_for_provider(
+            provider or active_profile.provider,
+            api_format or active_profile.api_format,
+        )
+
+    env_resolved = resolve_auth_env_value(env_auth_source)
+    if env_resolved:
+        _, api_key = env_resolved
         updates["api_key"] = api_key
 
-    api_format = os.environ.get("OPENHARNESS_API_FORMAT")
     if api_format:
         updates["api_format"] = api_format
 
-    provider = os.environ.get("OPENHARNESS_PROVIDER")
     if provider:
         updates["provider"] = provider
 
@@ -900,6 +1016,23 @@ def _apply_env_overrides(settings: Settings) -> Settings:
         )
     if sandbox_updates:
         updates["sandbox"] = settings.sandbox.model_copy(update=sandbox_updates)
+
+    web_updates: dict[str, Any] = {}
+    web_proxy = os.environ.get("OPENHARNESS_WEB_PROXY")
+    if web_proxy:
+        web_updates["proxy"] = web_proxy
+    web_resolution_mode = os.environ.get("OPENHARNESS_WEB_RESOLUTION_MODE")
+    if web_resolution_mode:
+        web_updates["resolution_mode"] = web_resolution_mode
+    web_synthetic_dns_cidrs = os.environ.get("OPENHARNESS_WEB_SYNTHETIC_DNS_CIDRS")
+    if web_synthetic_dns_cidrs:
+        web_updates["synthetic_dns_cidrs"] = [
+            entry.strip()
+            for entry in web_synthetic_dns_cidrs.split(",")
+            if entry.strip()
+        ]
+    if web_updates:
+        updates["web"] = settings.web.model_copy(update=web_updates)
 
     if not updates:
         return settings
@@ -928,6 +1061,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
     if config_path.exists():
         raw = json.loads(config_path.read_text(encoding="utf-8"))
         settings = Settings.model_validate(raw)
+        env_profile = os.environ.get("OPENHARNESS_PROFILE")
+        if env_profile:
+            settings = settings.model_copy(update={"active_profile": env_profile.strip()})
         if "profiles" not in raw or "active_profile" not in raw:
             profile_name, profile = _profile_from_flat_settings(settings)
             merged_profiles = settings.merged_profiles()
@@ -940,7 +1076,11 @@ def load_settings(config_path: Path | None = None) -> Settings:
             )
         return _apply_env_overrides(settings.materialize_active_profile())
 
-    return _apply_env_overrides(Settings().materialize_active_profile())
+    settings = Settings()
+    env_profile = os.environ.get("OPENHARNESS_PROFILE")
+    if env_profile:
+        settings = settings.model_copy(update={"active_profile": env_profile.strip()})
+    return _apply_env_overrides(settings.materialize_active_profile())
 
 
 def save_settings(settings: Settings, config_path: Path | None = None) -> None:
