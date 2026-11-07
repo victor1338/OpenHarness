@@ -165,7 +165,8 @@ class ChannelManager:
         try:
             await channel.start()
         except Exception as e:
-            logger.error("Failed to start channel %s: %s", name, e)
+            setattr(channel, "last_error", str(e))
+            logger.exception("Failed to start channel %s", name)
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
