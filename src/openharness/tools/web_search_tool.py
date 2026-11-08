@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -41,7 +42,7 @@ class WebSearchTool(BaseTool):
         context: ToolExecutionContext,
     ) -> ToolResult:
         del context
-        endpoint = arguments.search_url or "https://html.duckduckgo.com/html/"
+        endpoint = arguments.search_url or os.environ.get("OPENHARNESS_WEB_SEARCH_URL") or "https://html.duckduckgo.com/html/"
         try:
             response = await fetch_public_http_response(
                 endpoint,
