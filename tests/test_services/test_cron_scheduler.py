@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -13,6 +15,7 @@ from openharness.services.cron_scheduler import (
     append_history,
     execute_job,
     load_history,
+    start_daemon,
     run_scheduler_loop,
 )
 
@@ -169,3 +172,42 @@ class TestSchedulerLoop:
         entries = load_history(job_name="test-once")
         assert len(entries) == 1
         assert entries[0]["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_once_mode_handles_signal_registration_failures(self) -> None:
+        """Signal handler setup should not block the scheduler loop on unsupported platforms."""
+        with patch("openharness.services.cron_scheduler.signal.signal", side_effect=ValueError()):
+            await run_scheduler_loop(once=True)
+
+
+class TestDaemonStartup:
+    def test_start_daemon_uses_portable_process_spawn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Windows startup should use subprocess spawning instead of fork."""
+        monkeypatch.setattr("openharness.services.cron_scheduler.get_platform", lambda: "windows")
+        monkeypatch.setattr(subprocess, "DETACHED_PROCESS", 0x00000008, raising=False)
+        monkeypatch.setattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False)
+
+        fake_process = Mock()
+        fake_process.pid = 4321
+        fake_process.poll.side_effect = [None]
+
+        spawned: dict[str, object] = {}
+
+        def _fake_popen(argv, **kwargs):
+            spawned["argv"] = argv
+            spawned["kwargs"] = kwargs
+            return fake_process
+
+        with patch("openharness.services.cron_scheduler.subprocess.Popen", side_effect=_fake_popen), patch(
+            "openharness.services.cron_scheduler.read_pid",
+            side_effect=[None, 4321],
+        ):
+            pid = start_daemon()
+
+        assert pid == 4321
+        assert spawned["argv"] == [sys.executable, "-m", "openharness.services.cron_scheduler"]
+        assert spawned["kwargs"]["creationflags"] == 0x00000208
+        assert spawned["kwargs"]["stdin"] is subprocess.DEVNULL
+        assert spawned["kwargs"]["stdout"] is subprocess.DEVNULL
+        assert spawned["kwargs"]["stderr"] is subprocess.DEVNULL
+        assert spawned["kwargs"]["close_fds"] is True
