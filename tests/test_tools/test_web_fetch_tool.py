@@ -10,6 +10,7 @@ import pytest
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.web_fetch_tool import WebFetchTool, WebFetchToolInput, _html_to_text
 from openharness.tools.web_search_tool import WebSearchTool, WebSearchToolInput
+from openharness.utils.network_guard import fetch_public_http_response
 
 
 @pytest.mark.asyncio
@@ -108,6 +109,73 @@ async def test_web_fetch_tool_rejects_non_public_targets(tmp_path):
 
     assert result.is_error is True
     assert "non-public" in result.output
+
+
+@pytest.mark.asyncio
+async def test_web_search_tool_uses_env_search_url(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_fetch(url: str, **kwargs: object) -> httpx.Response:
+        calls.append((url, kwargs))
+        request = httpx.Request("GET", url, params=kwargs.get("params"))
+        body = (
+            "<html><body>"
+            '<a class="result__a" href="https://example.com/docs">OpenHarness Docs</a>'
+            '<div class="result__snippet">Found through configured search.</div>'
+            "</body></html>"
+        )
+        return httpx.Response(200, text=body, request=request)
+
+    monkeypatch.setenv("OPENHARNESS_WEB_SEARCH_URL", "https://search.example.com/html")
+    monkeypatch.setitem(WebSearchTool.execute.__globals__, "fetch_public_http_response", fake_fetch)
+
+    tool = WebSearchTool()
+    result = await tool.execute(WebSearchToolInput(query="openharness docs"), ToolExecutionContext(cwd=tmp_path))
+
+    assert result.is_error is False
+    assert calls[0][0] == "https://search.example.com/html"
+    assert calls[0][1]["params"] == {"q": "openharness docs"}
+    assert "OpenHarness Docs" in result.output
+
+
+@pytest.mark.asyncio
+async def test_fetch_public_http_response_uses_openharness_web_proxy(monkeypatch):
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            seen.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, **kwargs: object) -> httpx.Response:
+            request = httpx.Request("GET", url, params=kwargs.get("params"))
+            return httpx.Response(200, text="ok", request=request)
+
+    monkeypatch.setenv("OPENHARNESS_WEB_PROXY", "http://proxy.example.com:7890")
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    async def fake_ensure_public_http_url(url: str) -> None:
+        return None
+
+    monkeypatch.setattr("openharness.utils.network_guard.ensure_public_http_url", fake_ensure_public_http_url)
+
+    response = await fetch_public_http_response("https://example.com/")
+
+    assert response.status_code == 200
+    assert seen["trust_env"] is False
+    assert seen["proxy"] == "http://proxy.example.com:7890"
+
+
+@pytest.mark.asyncio
+async def test_fetch_public_http_response_rejects_credentialed_proxy(monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_WEB_PROXY", "http://user:pass@proxy.example.com:7890")
+
+    with pytest.raises(ValueError, match="embedded credentials"):
+        await fetch_public_http_response("https://example.com/")
 
 
 @pytest.mark.asyncio
