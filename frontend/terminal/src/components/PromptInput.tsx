@@ -78,7 +78,14 @@ function MultilineTextInput({
 				return;
 			}
 
-			if (key.upArrow || key.downArrow || key.tab || (key.shift && key.tab) || key.escape || (key.ctrl && input === 'c')) {
+			if (
+				key.upArrow ||
+				key.downArrow ||
+				key.tab ||
+				(key.shift && key.tab) ||
+				key.escape ||
+				(key.ctrl && (input === 'c' || input === 'v'))
+			) {
 				return;
 			}
 
@@ -197,6 +204,8 @@ export function PromptInput({
 	toolName,
 	suppressSubmit,
 	statusLabel,
+	imageAttachmentLabels = [],
+	clipboardStatus,
 }: {
 	busy: boolean;
 	input: string;
@@ -205,6 +214,8 @@ export function PromptInput({
 	toolName?: string;
 	suppressSubmit?: boolean;
 	statusLabel?: string;
+	imageAttachmentLabels?: string[];
+	clipboardStatus?: string | null;
 }): React.JSX.Element {
 	const {theme} = useTheme();
 	const promptPrefix = busy ? '… ' : '> ';
@@ -216,6 +227,18 @@ export function PromptInput({
 					<Box>
 						<Spinner label={statusLabel ?? (toolName ? `Running ${toolName}...` : 'Running...')} />
 					</Box>
+				</Box>
+			) : null}
+			{imageAttachmentLabels.length > 0 ? (
+				<Box>
+					<Text color={theme.colors.accent}>
+						{imageAttachmentLabels.map((label, index) => `[image ${index + 1}: ${label}]`).join(' ')}
+					</Text>
+				</Box>
+			) : null}
+			{clipboardStatus ? (
+				<Box>
+					<Text color={theme.colors.muted}>{clipboardStatus}</Text>
 				</Box>
 			) : null}
 			<MultilineTextInput
