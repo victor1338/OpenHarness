@@ -1,9 +1,10 @@
 import json
+import logging
 from pathlib import Path
 
 from typer.testing import CliRunner
 
-from ohmo.cli import app
+from ohmo.cli import _build_gateway_logging_handlers, app
 
 
 def test_ohmo_help():
@@ -46,6 +47,42 @@ def test_ohmo_init_noninteractive_defaults_to_deny_all_remote_access(tmp_path: P
     assert result.exit_code == 0
     config = json.loads((workspace / "gateway.json").read_text(encoding="utf-8"))
     assert config["channel_configs"] == {}
+
+
+def test_gateway_logging_handlers_write_gateway_log_file(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--workspace", str(workspace), "--no-interactive"])
+    assert result.exit_code == 0
+
+    handlers = _build_gateway_logging_handlers(workspace, console=True, log_file=True)
+    try:
+        file_handlers = [handler for handler in handlers if isinstance(handler, logging.FileHandler)]
+        console_handlers = [
+            handler
+            for handler in handlers
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+        ]
+        assert len(file_handlers) == 1
+        assert len(console_handlers) == 1
+
+        record = logging.LogRecord(
+            name="ohmo.gateway.test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="GATEWAY_LOG_OK",
+            args=(),
+            exc_info=None,
+        )
+        file_handlers[0].emit(record)
+        file_handlers[0].flush()
+
+        log_path = workspace / "logs" / "gateway.log"
+        assert "GATEWAY_LOG_OK" in log_path.read_text(encoding="utf-8")
+    finally:
+        for handler in handlers:
+            handler.close()
 
 
 def test_ohmo_init_interactive_writes_gateway_config(tmp_path: Path, monkeypatch):
@@ -116,6 +153,7 @@ def test_ohmo_init_interactive_writes_feishu_gateway_config(tmp_path: Path, monk
             "n",         # discord
             "y",         # feishu
             "feishu-user-1",         # allow_from
+            "1",         # domain -> Feishu (China)
             "cli_app",   # app_id
             "cli_secret",# app_secret
             "enc_key",   # encrypt_key
@@ -133,6 +171,7 @@ def test_ohmo_init_interactive_writes_feishu_gateway_config(tmp_path: Path, monk
     assert result.exit_code == 0
     config = json.loads((workspace / "gateway.json").read_text(encoding="utf-8"))
     assert config["enabled_channels"] == ["feishu"]
+    assert config["channel_configs"]["feishu"]["domain"] == "https://open.feishu.cn"
     assert config["channel_configs"]["feishu"]["app_id"] == "cli_app"
     assert config["channel_configs"]["feishu"]["app_secret"] == "cli_secret"
     assert config["channel_configs"]["feishu"]["encrypt_key"] == "enc_key"
@@ -159,6 +198,7 @@ def test_ohmo_config_interactive_can_restart_gateway(tmp_path: Path, monkeypatch
             "n",          # discord
             "y",          # feishu
             "feishu-user-1",          # allow_from
+            "2",          # domain -> Lark (International)
             "cli_app",    # app_id
             "cli_secret", # app_secret
             "",           # encrypt_key
@@ -179,6 +219,7 @@ def test_ohmo_config_interactive_can_restart_gateway(tmp_path: Path, monkeypatch
     config = json.loads((workspace / "gateway.json").read_text(encoding="utf-8"))
     assert config["provider_profile"] == "codex"
     assert config["enabled_channels"] == ["feishu"]
+    assert config["channel_configs"]["feishu"]["domain"] == "https://open.larksuite.com"
 
 
 def test_ohmo_config_keeps_existing_channel_when_not_reconfigured(tmp_path: Path, monkeypatch):

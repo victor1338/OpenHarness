@@ -8,6 +8,7 @@ const WAIT_FRAMES = [
 	'Agent is waiting for your input.. ',
 	'Agent is waiting for your input...',
 ];
+const MAX_DIFF_LINES = 40;
 
 function WaitingAnimation(): React.JSX.Element {
 	const [frame, setFrame] = useState(0);
@@ -85,6 +86,104 @@ function QuestionModal({
 	);
 }
 
+type DiffLineKind = 'add' | 'del' | 'hunk' | 'context';
+
+type ParsedDiffLine = {
+	kind: DiffLineKind;
+	content: string;
+};
+
+function parseDiffLines(diffText: string): ParsedDiffLine[] {
+	return diffText
+		.split('\n')
+		.flatMap((raw): ParsedDiffLine[] => {
+			if (!raw || raw.startsWith('+++') || raw.startsWith('---')) {
+				return [];
+			}
+			if (raw.startsWith('@@')) {
+				return [{kind: 'hunk', content: raw}];
+			}
+			if (raw.startsWith('+')) {
+				return [{kind: 'add', content: raw.slice(1)}];
+			}
+			if (raw.startsWith('-')) {
+				return [{kind: 'del', content: raw.slice(1)}];
+			}
+			return [{kind: 'context', content: raw.startsWith(' ') ? raw.slice(1) : raw}];
+		});
+}
+
+function EditDiffModal({modal}: {modal: Record<string, unknown>}): React.JSX.Element {
+	const path = String(modal.path ?? '');
+	const added = Number(modal.added ?? 0);
+	const removed = Number(modal.removed ?? 0);
+	const lines = parseDiffLines(String(modal.diff ?? ''));
+	const visibleLines = lines.slice(0, MAX_DIFF_LINES);
+	const hiddenCount = lines.length - visibleLines.length;
+
+	return (
+		<Box flexDirection="column" marginTop={1}>
+			<Text>
+				<Text color="yellow" bold>{'\u250C '}</Text>
+				<Text bold>Edit </Text>
+				<Text color="cyan" bold>{path}</Text>
+				<Text>{'  '}</Text>
+				<Text color="green">{`+${added}`}</Text>
+				<Text>{' '}</Text>
+				<Text color="red">{`-${removed}`}</Text>
+			</Text>
+			{visibleLines.map((line, index) => {
+				if (line.kind === 'hunk') {
+					return (
+						<Text key={index}>
+							<Text color="yellow">{'\u2502 '}</Text>
+							<Text color="cyan" dimColor>{line.content}</Text>
+						</Text>
+					);
+				}
+				if (line.kind === 'add') {
+					return (
+						<Text key={index}>
+							<Text color="yellow">{'\u2502 '}</Text>
+							<Text color="green">+</Text>
+							<Text color="green">{line.content}</Text>
+						</Text>
+					);
+				}
+				if (line.kind === 'del') {
+					return (
+						<Text key={index}>
+							<Text color="yellow">{'\u2502 '}</Text>
+							<Text color="red">-</Text>
+							<Text color="red">{line.content}</Text>
+						</Text>
+					);
+				}
+				return (
+					<Text key={index}>
+						<Text color="yellow">{'\u2502 '}</Text>
+						<Text dimColor>{' '}{line.content}</Text>
+					</Text>
+				);
+			})}
+			{hiddenCount > 0 ? (
+				<Text>
+					<Text color="yellow">{'\u2502 '}</Text>
+					<Text dimColor>... {hiddenCount} more lines hidden</Text>
+				</Text>
+			) : null}
+			<Text>
+				<Text color="yellow">{'\u2514 '}</Text>
+				<Text color="green">[y] Once</Text>
+				<Text>{'  '}</Text>
+				<Text color="green">[a] Always</Text>
+				<Text>{'  '}</Text>
+				<Text color="red">[n] Deny</Text>
+			</Text>
+		</Box>
+	);
+}
+
 function ModalHostInner({
 	modal,
 	modalInput,
@@ -119,6 +218,9 @@ function ModalHostInner({
 				</Text>
 			</Box>
 		);
+	}
+	if (modal?.kind === 'edit_diff') {
+		return <EditDiffModal modal={modal} />;
 	}
 	if (modal?.kind === 'question') {
 		return (
