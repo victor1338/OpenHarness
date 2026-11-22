@@ -163,3 +163,31 @@ async def test_grep_tool_python_fallback_reports_invalid_regex(monkeypatch, tmp_
     assert result.is_error is False
     assert "invalid regex pattern 'hello('" in result.output
     assert "unterminated subpattern" in result.output
+
+
+@pytest.mark.asyncio
+async def test_grep_tool_reports_missing_root_before_spawning_rg(monkeypatch, tmp_path: Path):
+    tool = GrepTool()
+    src_root = tmp_path / "src"
+    tests_root = tmp_path / "tests"
+    src_root.mkdir()
+    tests_root.mkdir()
+    monkeypatch.setattr("openharness.tools.grep_tool.shutil.which", lambda _: "/usr/bin/rg")
+
+    async def fail_create_subprocess_exec(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("rg should not be spawned for a missing root")
+
+    monkeypatch.setattr(
+        "openharness.tools.grep_tool.asyncio.create_subprocess_exec",
+        fail_create_subprocess_exec,
+    )
+
+    result = await tool.execute(
+        GrepToolInput(pattern="continue", root=f"{src_root} {tests_root}"),
+        type("Ctx", (), {"cwd": tmp_path})(),
+    )
+
+    assert result.is_error is True
+    assert "Search root does not exist" in result.output
+    assert "call grep separately for each root" in result.output
