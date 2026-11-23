@@ -27,6 +27,7 @@ from openharness.engine.messages import (
     ImageBlock,
     TextBlock,
     ToolResultBlock,
+    ToolUseBlock,
 )
 from openharness.engine.stream_events import (
     AssistantTextDelta,
@@ -44,6 +45,7 @@ from openharness.permissions.checker import PermissionChecker
 from openharness.services.tool_outputs import tool_output_inline_chars, tool_output_preview_chars
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.base import ToolRegistry
+from openharness.tools.file_read_tool import FileReadToolInput
 
 AUTO_COMPACT_STATUS_MESSAGE = "Auto-compacting conversation memory to keep things fast and focused."
 REACTIVE_COMPACT_STATUS_MESSAGE = "Prompt too long; compacting conversation memory and retrying."
@@ -147,6 +149,7 @@ class QueryContext:
     model: str
     system_prompt: str
     max_tokens: int
+    effort: str | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
     permission_prompt: PermissionPrompt | None = None
@@ -398,6 +401,7 @@ def _record_tool_carryover(
     *,
     tool_name: str,
     tool_input: dict[str, object],
+    parsed_input: object,
     tool_output: str,
     tool_result_metadata: dict[str, object] | None,
     is_error: bool,
@@ -407,9 +411,13 @@ def _record_tool_carryover(
         return
     if resolved_file_path is not None:
         _remember_active_artifact(context.tool_metadata, resolved_file_path)
-    if tool_name == "read_file" and resolved_file_path is not None:
-        offset = int(tool_input.get("offset") or 0)
-        limit = int(tool_input.get("limit") or 200)
+    if (
+        tool_name == "read_file"
+        and resolved_file_path is not None
+        and isinstance(parsed_input, FileReadToolInput)
+    ):
+        offset = parsed_input.offset
+        limit = parsed_input.limit
         _remember_read_file(
             context.tool_metadata,
             path=resolved_file_path,
@@ -540,7 +548,7 @@ def _offload_tool_output_if_needed(
     preview = output[:tool_output_preview_chars()]
     omitted = max(0, len(output) - len(preview))
     inline = (
-        "[Tool output truncated]\n"
+        "[Tool output truncated — the preview below is incomplete]\n"
         f"Tool: {tool_name}\n"
         f"Tool use id: {tool_use_id}\n"
         f"Original size: {len(output)} chars\n"
@@ -549,6 +557,7 @@ def _offload_tool_output_if_needed(
     )
     if omitted:
         inline += f" ({omitted} chars omitted)"
+    inline += "\nRead the full output file for details omitted from the preview."
     if preview:
         inline += f"\n\nPreview:\n{preview}"
     return inline, artifact_path
@@ -733,6 +742,7 @@ async def run_query(
                     system_prompt=context.system_prompt,
                     max_tokens=effective_max_tokens,
                     tools=context.tool_registry.to_api_schema(),
+                    effort=context.effort,
                 )
             ):
                 if isinstance(event, ApiThinkingDeltaEvent):
@@ -825,56 +835,78 @@ async def run_query(
             # Single tool: sequential (stream events immediately)
             tc = tool_calls[0]
             yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
-            result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
+            try:
+                result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
+            except Exception as exc:
+                result = _tool_result_or_error(tc, exc)
+            tool_results = [result]
+            messages.append(ConversationMessage(role="user", content=tool_results))
             yield ToolExecutionCompleted(
                 tool_name=tc.name,
                 output=result.content,
                 is_error=result.is_error,
+                metadata=result.result_metadata,
             ), None
-            tool_results = [result]
         else:
             # Multiple tools: execute concurrently, emit events after
             for tc in tool_calls:
                 yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
 
-            async def _run(tc):
-                return await _execute_tool_call(context, tc.name, tc.id, tc.input)
+            tasks = [
+                asyncio.create_task(_execute_tool_call(context, tc.name, tc.id, tc.input))
+                for tc in tool_calls
+            ]
+            try:
+                raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                if any(not task.cancelled() for task in tasks):
+                    # Keep completed results and pair every interrupted call so the
+                    # provider can accept the history when the user resumes.
+                    interrupted_results = [
+                        _tool_result_or_error(
+                            tc,
+                            asyncio.CancelledError() if task.cancelled()
+                            else task.exception() or task.result(),
+                        )
+                        for tc, task in zip(tool_calls, tasks)
+                    ]
+                    messages.append(ConversationMessage(role="user", content=interrupted_results))
+                raise
+            tool_results = [
+                _tool_result_or_error(tc, result)
+                for tc, result in zip(tool_calls, raw_results)
+            ]
 
-            # Use return_exceptions=True so a single failing tool does not abandon
-            # its siblings as cancelled coroutines and leave the conversation with
-            # un-replied tool_use blocks (Anthropic's API rejects the next request
-            # on the session if any tool_use is missing a matching tool_result).
-            raw_results = await asyncio.gather(
-                *[_run(tc) for tc in tool_calls], return_exceptions=True
-            )
-            tool_results = []
-            for tc, result in zip(tool_calls, raw_results):
-                if isinstance(result, BaseException):
-                    log.exception(
-                        "tool execution raised: name=%s id=%s",
-                        tc.name,
-                        tc.id,
-                        exc_info=result,
-                    )
-                    result = ToolResultBlock(
-                        tool_use_id=tc.id,
-                        content=f"Tool {tc.name} failed: {type(result).__name__}: {result}",
-                        is_error=True,
-                    )
-                tool_results.append(result)
-
+            messages.append(ConversationMessage(role="user", content=tool_results))
             for tc, result in zip(tool_calls, tool_results):
                 yield ToolExecutionCompleted(
                     tool_name=tc.name,
                     output=result.content,
                     is_error=result.is_error,
+                    metadata=result.result_metadata,
                 ), None
-
-        messages.append(ConversationMessage(role="user", content=tool_results))
 
     if context.max_turns is not None:
         raise MaxTurnsExceeded(context.max_turns)
     raise RuntimeError("Query loop exited without a max_turns limit or final response")
+
+
+def _tool_result_or_error(
+    tool_call: ToolUseBlock, result: ToolResultBlock | BaseException
+) -> ToolResultBlock:
+    if isinstance(result, ToolResultBlock):
+        return result
+    if isinstance(result, asyncio.CancelledError):
+        content = f"Tool {tool_call.name} was interrupted."
+    else:
+        log.error(
+            "tool execution raised: name=%s id=%s",
+            tool_call.name,
+            tool_call.id,
+            exc_info=result,
+        )
+        content = f"Tool {tool_call.name} failed: {type(result).__name__}: {result}"
+    return ToolResultBlock(tool_use_id=tool_call.id, content=content, is_error=True)
 
 
 async def _execute_tool_call(
@@ -986,11 +1018,13 @@ async def _execute_tool_call(
         tool_use_id=tool_use_id,
         content=inline_output,
         is_error=result.is_error,
+        result_metadata=dict(result.metadata or {}),
     )
     _record_tool_carryover(
         context,
         tool_name=tool_name,
         tool_input=tool_input,
+        parsed_input=parsed_input,
         tool_output=tool_result.content,
         tool_result_metadata=result.metadata,
         is_error=tool_result.is_error,

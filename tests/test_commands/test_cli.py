@@ -31,6 +31,36 @@ def test_cli_help():
     assert "--dry-run" in plain_output
 
 
+def test_plugin_cli_toggles_installed_plugin_without_importing_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    source = tmp_path / "source-directory"
+    tools_dir = source / "tools"
+    tools_dir.mkdir(parents=True)
+    (source / "plugin.json").write_text(
+        json.dumps({"name": "demo-plugin", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+    marker = tmp_path / "plugin-imported"
+    (tools_dir / "example.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n", encoding="utf-8"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["plugin", "install", str(source)])
+    assert result.exit_code == 0, result.output
+    assert "demo-plugin" not in load_settings().enabled_plugins
+
+    for action, enabled in (("enable", True), ("disable", False)):
+        result = runner.invoke(app, ["plugin", action, "demo-plugin"])
+        assert result.exit_code == 0, result.output
+        assert load_settings().enabled_plugins["demo-plugin"] is enabled
+
+    result = runner.invoke(app, ["plugin", "enable", "missing-plugin"])
+    assert result.exit_code == 1
+    assert "not installed" in result.output
+    assert not marker.exists()
+
+
 def test_setup_flow_selects_profile_and_model(tmp_path: Path, monkeypatch):
     runner = CliRunner()
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path))
@@ -361,8 +391,8 @@ def test_build_dry_run_preview_classifies_slash_command_and_flags_bad_mcp(monkey
         lambda settings: types.SimpleNamespace(name="anthropic"),
     )
     monkeypatch.setattr("openharness.api.provider.auth_status", lambda settings: "configured")
-    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd: [])
-    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd, settings=None: _FakeSkillRegistry())
+    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd, **kwargs: [])
+    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd=None, **kwargs: _FakeSkillRegistry())
     monkeypatch.setattr("openharness.prompts.context.build_runtime_system_prompt", lambda *args, **kwargs: "preview prompt")
     monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", lambda settings: object())
 
@@ -389,6 +419,68 @@ def test_build_dry_run_preview_classifies_slash_command_and_flags_bad_mcp(monkey
     assert "command not found in PATH" in preview["mcp_servers"][0]["issues"][0]
 
 
+def test_dry_run_does_not_import_enabled_plugin_tool_modules(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    project = tmp_path / "project"
+    tools_dir = project / ".openharness" / "plugins" / "side-effect-plugin" / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir.parent / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "side-effect-plugin",
+                "version": "1.0.0",
+                "description": "Plugin used to verify dry-run isolation",
+                "enabled_by_default": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker = tmp_path / "plugin-imported.txt"
+    (tools_dir / "side_effect.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        api_key="sk-test",
+        allow_project_plugins=True,
+        allow_project_skills=False,
+        memory={"enabled": False},
+    )
+
+    class _FakeSkillRegistry:
+        def list_skills(self):
+            return []
+
+    monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+    monkeypatch.setattr("openharness.commands.registry.load_skill_registry", lambda *args, **kwargs: _FakeSkillRegistry())
+    monkeypatch.setattr("openharness.skills.loader.load_user_skills", lambda: [])
+    monkeypatch.setattr(
+        "openharness.api.provider.detect_provider",
+        lambda settings: types.SimpleNamespace(name="anthropic"),
+    )
+    monkeypatch.setattr("openharness.api.provider.auth_status", lambda settings: "configured")
+    monkeypatch.setattr("openharness.prompts.context.load_claude_md_prompt", lambda cwd: None)
+    monkeypatch.setattr("openharness.prompts.context.load_local_rules", lambda: None)
+    monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", lambda settings: object())
+
+    preview = cli._build_dry_run_preview(
+        prompt="inspect the project",
+        cwd=str(project),
+        model=None,
+        max_turns=None,
+        base_url=None,
+        system_prompt=None,
+        append_system_prompt=None,
+        api_key=None,
+        api_format=None,
+        permission_mode=None,
+    )
+
+    assert preview["plugins"][0]["name"] == "side-effect-plugin"
+    assert not marker.exists()
+
+
 def test_build_dry_run_preview_sets_blocked_when_model_prompt_lacks_auth(monkeypatch, tmp_path: Path):
     settings = Settings(api_key="")
 
@@ -402,8 +494,8 @@ def test_build_dry_run_preview_sets_blocked_when_model_prompt_lacks_auth(monkeyp
         lambda settings: types.SimpleNamespace(name="anthropic"),
     )
     monkeypatch.setattr("openharness.api.provider.auth_status", lambda settings: "missing")
-    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd: [])
-    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd, settings=None: _FakeSkillRegistry())
+    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd, **kwargs: [])
+    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd=None, **kwargs: _FakeSkillRegistry())
     monkeypatch.setattr("openharness.prompts.context.build_runtime_system_prompt", lambda *args, **kwargs: "preview prompt")
 
     def fake_resolve_api_client(settings):
@@ -471,8 +563,8 @@ def test_build_dry_run_preview_recommends_matching_skills_and_tools(monkeypatch,
         lambda settings: types.SimpleNamespace(name="anthropic"),
     )
     monkeypatch.setattr("openharness.api.provider.auth_status", lambda settings: "configured")
-    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd: [])
-    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd, settings=None: _FakeSkillRegistry())
+    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd, **kwargs: [])
+    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd=None, **kwargs: _FakeSkillRegistry())
     monkeypatch.setattr("openharness.tools.create_default_tool_registry", lambda: _FakeToolRegistry())
     monkeypatch.setattr("openharness.prompts.context.build_runtime_system_prompt", lambda *args, **kwargs: "preview prompt")
     monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", lambda settings: object())
@@ -557,3 +649,148 @@ def test_autopilot_export_dashboard_cli(monkeypatch, tmp_path: Path):
 
     assert result.exit_code == 0
     assert "Exported autopilot dashboard" in result.output
+
+
+def test_cron_status_json(monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setattr(
+        "openharness.services.cron_scheduler.scheduler_status",
+        lambda: {
+            "running": True,
+            "pid": 4321,
+            "enabled_jobs": 2,
+            "total_jobs": 3,
+            "log_file": Path("/tmp/cron_scheduler.log"),  # Path -> coerced by default=str
+        },
+    )
+
+    result = runner.invoke(app, ["cron", "status", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["running"] is True
+    assert payload["enabled_jobs"] == 2
+    assert payload["log_file"] == "/tmp/cron_scheduler.log"
+
+
+def test_cron_list_json(monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setattr(
+        "openharness.services.cron.load_cron_jobs",
+        lambda: [
+            {"name": "nightly", "schedule": "0 2 * * *", "enabled": True, "command": "echo hi"}
+        ],
+    )
+
+    result = runner.invoke(app, ["cron", "list", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert isinstance(payload, list)
+    assert payload[0]["name"] == "nightly"
+    assert payload[0]["enabled"] is True
+
+
+def test_cron_list_json_empty_is_array(monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setattr("openharness.services.cron.load_cron_jobs", lambda: [])
+
+    result = runner.invoke(app, ["cron", "list", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == []  # JSON mode never prints the human "No jobs" line
+
+
+def test_cron_history_json(monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setattr(
+        "openharness.services.cron_scheduler.load_history",
+        lambda limit, job_name: [
+            {"started_at": "2026-06-04T02:00:00", "name": "nightly", "status": "success", "returncode": 0}
+        ],
+    )
+
+    result = runner.invoke(app, ["cron", "history", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload[0]["status"] == "success"
+
+
+def test_autopilot_status_json(monkeypatch):
+    runner = CliRunner()
+
+    class FakeStore:
+        def __init__(self, cwd):
+            self.registry_path = Path("/tmp/registry.json")
+            self.journal_path = Path("/tmp/journal.jsonl")
+            self.context_path = Path("/tmp/context.md")
+
+        def stats(self):
+            return {"queued": 2, "completed": 1}
+
+        def pick_next_card(self):
+            return types.SimpleNamespace(id="ap-1", title="Fix flaky test", score=7)
+
+    monkeypatch.setattr("openharness.autopilot.RepoAutopilotStore", FakeStore)
+
+    result = runner.invoke(app, ["autopilot", "status", "--json", "--cwd", "/tmp"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["counts"]["queued"] == 2
+    assert payload["next"]["id"] == "ap-1"
+    assert payload["registry"] == "/tmp/registry.json"
+
+
+def test_autopilot_status_json_no_next_card(monkeypatch):
+    runner = CliRunner()
+
+    class FakeStore:
+        def __init__(self, cwd):
+            self.registry_path = Path("/tmp/registry.json")
+            self.journal_path = Path("/tmp/journal.jsonl")
+            self.context_path = Path("/tmp/context.md")
+
+        def stats(self):
+            return {}
+
+        def pick_next_card(self):
+            return None
+
+    monkeypatch.setattr("openharness.autopilot.RepoAutopilotStore", FakeStore)
+
+    result = runner.invoke(app, ["autopilot", "status", "--json", "--cwd", "/tmp"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["next"] is None
+
+
+def test_autopilot_list_json(monkeypatch):
+    runner = CliRunner()
+
+    class FakeStore:
+        def __init__(self, cwd):
+            pass
+
+        def list_cards(self, status=None):
+            return [
+                types.SimpleNamespace(
+                    id="ap-1",
+                    status="queued",
+                    score=7,
+                    title="Fix flaky test",
+                    source_kind="manual_idea",
+                    source_ref=None,
+                    body="details",
+                )
+            ]
+
+    monkeypatch.setattr("openharness.autopilot.RepoAutopilotStore", FakeStore)
+
+    result = runner.invoke(app, ["autopilot", "list", "--json", "--cwd", "/tmp"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload[0]["id"] == "ap-1"
+    assert payload[0]["source_ref"] is None

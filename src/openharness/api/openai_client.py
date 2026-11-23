@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit, urlunsplit
@@ -171,13 +172,43 @@ def _convert_user_content_to_openai(blocks: list[ContentBlock]) -> str | list[di
     return content
 
 
+_EMPTY_REASONING_ENV = "OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT"
+
+
+def _empty_reasoning_required() -> bool:
+    """True when the operator's provider requires an empty
+    ``reasoning_content`` field on tool-using assistant messages
+    (Kimi-on-Anthropic style). Default off — strict-OpenAI providers
+    reject the field outright.
+    """
+    raw = os.environ.get(_EMPTY_REASONING_ENV, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _convert_assistant_message(msg: ConversationMessage) -> dict[str, Any]:
     """Convert an assistant ConversationMessage to OpenAI format.
 
-    Providers with thinking models (e.g. Kimi k2.5) require a
-    ``reasoning_content`` field on every assistant message that contains
-    tool calls.  We stash the raw reasoning text on ``msg._reasoning``
-    during parsing and replay it here.
+    ``reasoning_content`` is a non-standard field used by thinking models
+    (e.g. Kimi k2.5) to carry the model's internal chain-of-thought across
+    turns. Some thinking-model providers require it on every assistant
+    message with tool calls — even when empty — or they reject the request.
+    Other OpenAI-compatible providers (Cerebras, OpenAI's own
+    endpoint, etc.) reject the field outright with a 400
+    ``wrong_api_format`` error.
+
+    Behaviour:
+
+    - When the streaming parser captured non-empty reasoning on
+      ``msg._reasoning``, we always replay it. Models that emit reasoning
+      tokens are by definition thinking models that round-trip them.
+    - When there is no captured reasoning but the message has tool calls,
+      we emit ``reasoning_content: ""`` only if the operator opts in via
+      ``OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT=1``. The default is
+      omit, which matches strict-OpenAI providers.
+
+    The opt-in default keeps strict-OpenAI providers (Cerebras, NVIDIA NIM,
+    OpenAI direct, etc.) working out-of-the-box; Kimi-on-Anthropic users
+    set the env var in their dotfiles or settings.
     """
     text_parts = [b.text for b in msg.content if isinstance(b, TextBlock)]
     tool_uses = [b for b in msg.content if isinstance(b, ToolUseBlock)]
@@ -191,13 +222,16 @@ def _convert_assistant_message(msg: ConversationMessage) -> dict[str, Any]:
     reasoning = getattr(msg, "_reasoning", None)
     if reasoning:
         openai_msg["reasoning_content"] = reasoning
-    elif tool_uses:
-        # Thinking models require this field even if empty
+    elif tool_uses and _empty_reasoning_required():
+        # Kimi-style providers reject tool_use messages without this field
+        # even when there's nothing to put in it. Opt-in via env var.
         openai_msg["reasoning_content"] = ""
 
     if tool_uses:
-        openai_msg["tool_calls"] = [
-            {
+        # Gemini tool signatures must be sent back with their original call.
+        tool_calls: list[dict[str, Any]] = []
+        for tu in tool_uses:
+            call: dict[str, Any] = {
                 "id": tu.id,
                 "type": "function",
                 "function": {
@@ -205,8 +239,10 @@ def _convert_assistant_message(msg: ConversationMessage) -> dict[str, Any]:
                     "arguments": json.dumps(tu.input),
                 },
             }
-            for tu in tool_uses
-        ]
+            if tu.extra_content:
+                call["extra_content"] = tu.extra_content
+            tool_calls.append(call)
+        openai_msg["tool_calls"] = tool_calls
 
     return openai_msg
 
@@ -230,9 +266,25 @@ def _parse_assistant_response(response: Any) -> ConversationMessage:
                 id=tc.id,
                 name=tc.function.name,
                 input=args,
+                extra_content=_extract_tool_extra_content(tc),
             ))
 
     return ConversationMessage(role="assistant", content=content)
+
+
+def _extract_tool_extra_content(tc: Any) -> dict[str, Any] | None:
+    """Pull the OpenAI-compat ``extra_content`` off a tool call, if present.
+
+    Gemini surfaces its ``thought_signature`` here (``extra_content.google.
+    thought_signature``). The openai SDK exposes non-standard fields either as a
+    direct attribute or via ``model_extra``. Returns None when absent.
+    """
+    extra = getattr(tc, "extra_content", None)
+    if extra is None:
+        model_extra = getattr(tc, "model_extra", None)
+        if model_extra:
+            extra = model_extra.get("extra_content")
+    return extra if isinstance(extra, dict) else None
 
 
 def _normalize_openai_base_url(base_url: str | None) -> str | None:
@@ -269,6 +321,10 @@ class OpenAICompatibleClient:
         if timeout is not None:
             kwargs["timeout"] = timeout
         self._client = AsyncOpenAI(**kwargs)
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.close()
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         """Yield text deltas and the final message, matching the Anthropic client interface."""
@@ -326,6 +382,7 @@ class OpenAICompatibleClient:
         collected_content = ""
         collected_reasoning = ""
         collected_tool_calls: dict[int, dict[str, Any]] = {}
+        last_tool_idx: int | None = None
         finish_reason: str | None = None
         usage_data: dict[str, int] = {}
         # Buffer to strip inline <think>…</think> blocks across streaming chunks.
@@ -365,7 +422,21 @@ class OpenAICompatibleClient:
             # Accumulate tool calls
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
+                    idx = getattr(tc_delta, "index", None)
+                    extra = _extract_tool_extra_content(tc_delta)
+                    if idx is None:
+                        # A trailing signature delta may omit the call index.
+                        if extra:
+                            call_id = getattr(tc_delta, "id", None)
+                            target_idx = (
+                                next((key for key, call in collected_tool_calls.items()
+                                      if call["id"] == call_id), None)
+                                if call_id else last_tool_idx
+                            )
+                            if target_idx is not None:
+                                collected_tool_calls[target_idx]["extra_content"] = extra
+                        continue
+                    last_tool_idx = idx
                     if idx not in collected_tool_calls:
                         collected_tool_calls[idx] = {
                             "id": tc_delta.id or "",
@@ -380,6 +451,8 @@ class OpenAICompatibleClient:
                             entry["name"] = tc_delta.function.name
                         if tc_delta.function.arguments:
                             entry["arguments"] += tc_delta.function.arguments
+                    if extra:
+                        entry["extra_content"] = extra
 
             # Usage in chunk (if provider sends it)
             if chunk.usage:
@@ -406,6 +479,7 @@ class OpenAICompatibleClient:
                 id=tc["id"],
                 name=tc["name"],
                 input=args,
+                extra_content=tc.get("extra_content"),
             ))
 
         final_message = ConversationMessage(role="assistant", content=content)

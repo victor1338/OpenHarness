@@ -200,6 +200,7 @@ class BackgroundTaskManager:
             raise ValueError(f"Task {task_id} is not running")
 
         process.terminate()
+        task.status = "killed"
         try:
             await asyncio.wait_for(process.wait(), timeout=3)
         except asyncio.TimeoutError:
@@ -207,7 +208,7 @@ class BackgroundTaskManager:
             await process.wait()
         await _close_process_stdin(process)
 
-        task.status = "killed"
+        task.return_code = process.returncode
         task.ended_at = time.time()
         return task
 
@@ -458,6 +459,7 @@ def _task_id(task_type: TaskType) -> str:
         "local_agent": "a",
         "remote_agent": "r",
         "in_process_teammate": "t",
+        "dream": "d",
     }
     return f"{prefixes[task_type]}{uuid4().hex[:8]}"
 

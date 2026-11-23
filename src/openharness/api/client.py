@@ -45,6 +45,7 @@ class ApiMessageRequest:
     system_prompt: str | None = None
     max_tokens: int = 4096
     tools: list[dict[str, Any]] = field(default_factory=list)
+    effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,10 @@ class AnthropicApiClient:
         if self._base_url:
             kwargs["base_url"] = self._base_url
         return AsyncAnthropic(**kwargs)
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.close()
 
     def _refresh_client_auth(self) -> None:
         if not self._claude_oauth or self._auth_token_resolver is None:
