@@ -361,7 +361,7 @@ oh --dry-run -p "Explain this repository" --output-format json
 Dry-run is intentionally static:
 
 - It does **not** call the model
-- It does **not** execute tools or spawn subagents
+- It does **not** import plugin tool modules, execute tools, or spawn subagents
 - It does **not** connect to MCP servers
 - It **does** resolve settings, auth status, prompt assembly, skills, commands, tools, and obvious MCP config problems
 
@@ -642,6 +642,22 @@ Use `/skills` to list loaded skills with their source and path. User-invocable s
 
 **Compatible with [anthropics/skills](https://github.com/anthropics/skills)** — use the `SKILL.md` directory layout above.
 
+### 🌐 Web search and proxy settings
+
+Built-in `web_search` uses DuckDuckGo HTML search by default. In regions where that endpoint is unreachable, point OpenHarness at a trusted public HTML search endpoint or your own SearXNG instance:
+
+```bash
+export OPENHARNESS_WEB_SEARCH_URL="https://your-searxng.example/search"
+```
+
+`web_search` and `web_fetch` keep `trust_env=False` for SSRF safety, so they do not automatically inherit `HTTP_PROXY` / `HTTPS_PROXY`. If you need a proxy, opt in with an OpenHarness-specific variable:
+
+```bash
+export OPENHARNESS_WEB_PROXY="http://127.0.0.1:7890"
+```
+
+The proxy URL must be HTTP/HTTPS and cannot contain embedded credentials.
+
 ### 🔌 Plugin System
 
 **Compatible with [claude-code plugins](https://github.com/anthropics/claude-code/tree/main/plugins)**. Tested with 12 official plugins:
@@ -660,6 +676,7 @@ Use `/skills` to list loaded skills with their source and path. User-invocable s
 oh plugin list
 oh plugin install <source>
 oh plugin enable <name>
+oh plugin disable <name>
 ```
 
 ### 🤝 Ecosystem Workflows

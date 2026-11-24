@@ -6,6 +6,48 @@ The format is based on Keep a Changelog, and this project currently tracks chang
 
 ## [Unreleased]
 
+### Added
+
+- `oh cron status/list/history` and `oh autopilot status/list` now support `--json`.
+- `oh plugin enable` and `oh plugin disable` manage installed plugins from the CLI.
+
+- Hooks now support a `priority` field (default `0`). Within an event, hooks run highest-priority first, and hooks sharing a priority keep their registration order. This lets users order, for example, a security-check hook ahead of a logging hook regardless of where each is declared in settings or contributed by plugins.
+- `edit_file` and `write_file` in the React TUI now preview a unified diff before applying file changes, let users approve once or for the rest of the session, and skip the extra prompt automatically in `full_auto` mode.
+
+### Fixed
+
+- MiniMax model IDs now omit trailing context-window labels such as `[1M]` when sent to the API.
+- Gemini tool-call signatures survive session snapshots and are replayed with the original tool calls.
+- The skills prompt includes a concrete `skill` tool invocation.
+- OHMO gateway startup waits for the child to report readiness. Restart requests from the gateway's own shell are handled by the running gateway itself.
+
+- The `config` tool validates changes using the settings schema before saving them, including structured fields and fields without a current value.
+- Interactive `--debug` reaches the backend, and MCP connection logs report status without including command arguments, request URLs, or credentials.
+- Interrupting parallel tools preserves completed results and marks the remaining calls as interrupted so the conversation can continue.
+
+- Ohmo gateway now respects `send_tool_hints = false` in the bridge, preventing disabled tool hints from being published to the outbound bus or written to INFO logs.
+- `/resume <session_id>` now keeps writing subsequent turns to the restored session instead of creating a new session snapshot under the runtime's startup ID.
+- `read_file` now records the line range correctly when a model sends whole-number strings such as `"250.0"` for `offset` or `limit`.
+- Bound the `mcp` dependency to `<2.0.0`. MCP SDK 2.0 removed `mcp.server.fastmcp`, which the test suite relies on, so unrestricted `mcp>=1.0.0` resolution can install an incompatible version and break tests.
+- CI now explicitly selects Ruff rules `E4,E7,E9,F` to keep lint results stable across Ruff releases.
+- The test suite no longer picks up a contributor's real `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, or `ANTHROPIC_MODEL` environment variables. An autouse fixture clears them for every test, so machines that run Claude Code through a relay or subscription bridge see the same results as CI instead of shadowed auth and model assertions.
+- Stopping a background task now emits one completion notification with its exit code, avoiding duplicate callbacks and incomplete subagent-stop hook payloads.
+- Project and ohmo personal memory indexes now match exact Markdown link destinations, preventing overlapping memory filenames from hiding or removing unrelated index entries.
+- Initializing an agent memory snapshot now preserves an existing index containing user entries instead of treating any index with the default heading as empty.
+- Proactive ohmo notification chunking now preserves newline/indentation content and rejects nonpositive chunk limits instead of potentially looping forever.
+- ohmo gateway configuration updates now use atomic replacement so interrupted writes preserve the last valid gateway.json.
+- Corrupted project and ohmo session snapshot files no longer crash load/resume; missing or invalid snapshots return no session, and per-ID loading can fall back to a valid latest snapshot.
+- Memory scanning now skips unreadable or invalid UTF-8 notes, and migration reports such notes as failed rather than aborting the entire operation.
+- `oh --dry-run` now skips importing enabled plugin tool modules, so previewing a plugin configuration cannot execute tool-module initialization code.
+- Web URL validation now rejects malformed IPv6 authority and invalid port values as NetworkGuardError before outbound resolution or HTTP requests.
+- Multimodal model detection now recognizes OpenAI `gpt-4.1` and `gpt-5`
+  family model names, including `gpt-5.5`, so image inputs are sent natively
+  instead of being routed through the image-to-text fallback.
+- Truncated tool output now marks the preview as incomplete and points to the full output file.
+- Codex subscription requests now pass reasoning effort separately, enabling `gpt-5.5` with `xhigh` effort instead of treating `gpt-5.5 xhigh` as an unsupported model name.
+- Telegram channel now delivers replies again under `ohmo init --no-interactive` and other configs that do not write a `reply_to_message` field. `TelegramConfig` declares `reply_to_message: bool = True` so the attribute access in `TelegramChannel.send` no longer raises `AttributeError` and outbound progress/tool-hint/final messages are sent as expected. See issue #243.
+- Interrupting a tool-driven turn after a tool finishes now preserves its result, so `/continue` resumes the pending model turn instead of losing that result.
+
 ## [0.1.9] - 2026-05-07
 
 ### Added

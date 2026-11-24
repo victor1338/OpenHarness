@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import httpx
 
 import pytest
 
-from openharness.api.client import ApiMessageRequest
+from openharness.api.client import ApiMessageCompleteEvent, ApiMessageRequest
+from openharness.api.usage import UsageSnapshot
 from openharness.api.openai_client import (
     OpenAICompatibleClient,
+    _convert_assistant_message,
     _convert_messages_to_openai,
     _convert_tools_to_openai,
+    _extract_tool_extra_content,
     _normalize_openai_base_url,
+    _parse_assistant_response,
     _strip_think_blocks,
     _token_limit_param_for_model,
 )
@@ -435,3 +440,181 @@ class TestStripThinkBlocks:
         visible, buf = _strip_think_blocks(buf)
         assert visible == "answer"
         assert buf == ""
+
+
+class TestReasoningContentEmission:
+    """``reasoning_content`` is a non-standard field. It must round-trip
+    when the streaming parser captured non-empty reasoning, but the
+    legacy "emit empty string when there are tool calls" behaviour now
+    requires opt-in via ``OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT=1``.
+
+    Strict-OpenAI providers (Cerebras, NVIDIA NIM, OpenAI direct) reject
+    requests carrying the field with a ``wrong_api_format`` 400, so the
+    default-off behaviour fixes them out-of-the-box; Kimi-on-Anthropic
+    users opt in via env var.
+    """
+
+    def _msg_with_tool_use(self, *, reasoning: str | None = None) -> ConversationMessage:
+        msg = ConversationMessage(
+            role="assistant",
+            content=[
+                TextBlock(text="ok"),
+                ToolUseBlock(id="tool_1", name="read_file", input={"path": "x"}),
+            ],
+        )
+        if reasoning is not None:
+            msg._reasoning = reasoning  # type: ignore[attr-defined]
+        return msg
+
+    def test_omits_reasoning_when_no_captured_text(self, monkeypatch):
+        monkeypatch.delenv("OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT", raising=False)
+        out = _convert_assistant_message(self._msg_with_tool_use())
+        assert "reasoning_content" not in out
+
+    def test_replays_captured_reasoning(self, monkeypatch):
+        monkeypatch.delenv("OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT", raising=False)
+        out = _convert_assistant_message(self._msg_with_tool_use(reasoning="thinking…"))
+        assert out["reasoning_content"] == "thinking…"
+
+    def test_emits_empty_when_opted_in(self, monkeypatch):
+        monkeypatch.setenv("OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT", "1")
+        out = _convert_assistant_message(self._msg_with_tool_use())
+        assert out["reasoning_content"] == ""
+
+    def test_opt_in_truthy_values(self, monkeypatch):
+        for v in ("1", "true", "TRUE", "yes", "on"):
+            monkeypatch.setenv("OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT", v)
+            out = _convert_assistant_message(self._msg_with_tool_use())
+            assert out.get("reasoning_content") == "", f"value={v!r}"
+
+    def test_opt_in_falsy_values(self, monkeypatch):
+        for v in ("0", "false", "no", "off", ""):
+            monkeypatch.setenv("OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT", v)
+            out = _convert_assistant_message(self._msg_with_tool_use())
+            assert "reasoning_content" not in out, f"value={v!r} should not opt in"
+
+    def test_no_tool_calls_never_emits_empty(self, monkeypatch):
+        # Pure-text assistant messages have always omitted the field; the
+        # opt-in is scoped to tool-use messages where Kimi specifically
+        # demands the placeholder.
+        monkeypatch.setenv("OPENHARNESS_REQUIRE_EMPTY_REASONING_CONTENT", "1")
+        msg = ConversationMessage(role="assistant", content=[TextBlock(text="hi")])
+        out = _convert_assistant_message(msg)
+        assert "reasoning_content" not in out
+
+
+class _FakeToolCall:
+    """Minimal stand-in for an openai SDK tool-call object."""
+
+    def __init__(self, extra_content=None, model_extra=None):
+        if extra_content is not None:
+            self.extra_content = extra_content
+        self.model_extra = model_extra
+
+
+class TestThoughtSignatureRoundTrip:
+    """Gemini 3 returns a thought_signature (as ``extra_content``) on each tool
+    call that must be echoed back, or the follow-up request fails with a 400.
+    """
+
+    _SIG = {"google": {"thought_signature": "EjQKMg=="}}
+
+    def test_extract_from_direct_attribute(self):
+        assert _extract_tool_extra_content(_FakeToolCall(extra_content=self._SIG)) == self._SIG
+
+    def test_extract_from_model_extra(self):
+        tc = _FakeToolCall(model_extra={"extra_content": self._SIG})
+        assert _extract_tool_extra_content(tc) == self._SIG
+
+    def test_extract_absent_returns_none(self):
+        assert _extract_tool_extra_content(_FakeToolCall()) is None
+
+    def test_convert_replays_extra_content(self):
+        msg = _parse_assistant_response(SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[
+                SimpleNamespace(
+                    id="call_1", function=SimpleNamespace(name="read_file", arguments="{}"),
+                    extra_content=self._SIG,
+                ),
+            ])),
+        ]))
+        out = _convert_assistant_message(msg)
+        assert out["tool_calls"][0]["extra_content"] == self._SIG
+
+    def test_convert_omits_when_absent(self):
+        # Providers that don't set a thought_signature must be unaffected.
+        msg = ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="call_1", name="bash", input={"cmd": "ls"})],
+        )
+        out = _convert_assistant_message(msg)
+        assert "extra_content" not in out["tool_calls"][0]
+
+
+    @pytest.mark.asyncio
+    async def test_streaming_signature_is_replayed_after_snapshot_restore(self, tmp_path, monkeypatch):
+        from openharness.services.session_storage import load_session_by_id, save_session_snapshot
+
+        monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+        chunks = [
+            [
+                {
+                    "index": index,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+                for index, call_id in enumerate(("call_1", "call_2"))
+            ],
+            [{"id": "call_1", "extra_content": self._SIG}],
+        ]
+        events = [
+            {
+                "id": "example",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gemini-test",
+                "choices": [{"index": 0, "delta": {"tool_calls": calls}}],
+            }
+            for calls in chunks
+        ]
+        stream = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+        requests = []
+
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, text=stream, headers={"Content-Type": "text/event-stream"})
+
+        client = OpenAICompatibleClient(api_key="test-key", base_url="https://example.test/v1")
+        await client._client._client.aclose()
+        client._client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        prompt = ConversationMessage.from_user_text("Read two files")
+        try:
+            result = [
+                event async for event in client.stream_message(
+                    ApiMessageRequest(model="gemini-test", messages=[prompt])
+                )
+            ]
+            assistant = result[-1]
+            assert isinstance(assistant, ApiMessageCompleteEvent)
+            tool_results = ConversationMessage(role="user", content=[
+                ToolResultBlock(tool_use_id=call_id, content="ok") for call_id in ("call_1", "call_2")
+            ])
+            save_session_snapshot(
+                cwd=tmp_path, model="gemini-test", system_prompt="",
+                messages=[prompt, assistant.message, tool_results],
+                usage=UsageSnapshot(), session_id="gemini-resume",
+            )
+            stored = load_session_by_id(tmp_path, "gemini-resume")
+            restored = [ConversationMessage.model_validate(item) for item in stored["messages"]]
+            _ = [
+                event async for event in client.stream_message(
+                    ApiMessageRequest(model="gemini-test", messages=restored)
+                )
+            ]
+        finally:
+            await client.close()
+
+        call_1, call_2 = requests[1]["messages"][1]["tool_calls"]
+        assert call_1["id"] == "call_1" and call_1["extra_content"] == self._SIG
+        assert call_2["id"] == "call_2" and "extra_content" not in call_2
