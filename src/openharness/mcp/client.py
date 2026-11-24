@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -20,6 +21,8 @@ from openharness.mcp.types import (
     McpStdioServerConfig,
     McpToolInfo,
 )
+
+log = logging.getLogger(__name__)
 
 
 class McpServerNotConnectedError(Exception):
@@ -45,18 +48,31 @@ class McpClientManager:
     async def connect_all(self) -> None:
         """Connect all configured MCP servers supported by the current build."""
         for name, config in self._server_configs.items():
+            transport = getattr(config, "type", "unknown")
+            log.debug("MCP: connecting to server %r (transport=%s)", name, transport)
             if isinstance(config, McpStdioServerConfig):
                 await self._connect_stdio(name, config)
             elif isinstance(config, McpHttpServerConfig):
                 await self._connect_http(name, config)
             else:
+                detail = f"Unsupported MCP transport in current build: {config.type}"
+                log.warning("MCP: server %r skipped — %s", name, detail)
                 self._statuses[name] = McpConnectionStatus(
                     name=name,
                     state="failed",
                     transport=config.type,
                     auth_configured=bool(getattr(config, "headers", None)),
-                    detail=f"Unsupported MCP transport in current build: {config.type}",
+                    detail=detail,
                 )
+            status = self._statuses.get(name)
+            if status:
+                if status.state == "connected":
+                    log.debug(
+                        "MCP: %r connected — %d tools, %d resources",
+                        name,
+                        len(status.tools),
+                        len(status.resources),
+                    )
 
     async def reconnect_all(self) -> None:
         """Reconnect all configured servers."""
@@ -75,13 +91,18 @@ class McpClientManager:
         """Return one configured server object if present."""
         return self._server_configs.get(name)
 
-    async def _close_failed_stack(self, stack: AsyncExitStack) -> None:
-        """Best-effort cleanup for a connection attempt that never finished."""
+    async def _close_failed_stack(
+        self, stack: AsyncExitStack, failure: BaseException
+    ) -> BaseException:
+        """Close a failed connection and keep the transport error if it interrupted setup."""
         try:
             await stack.aclose()
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
+            if isinstance(failure, asyncio.CancelledError):
+                return exc
+        return failure
 
     def _mark_connection_failed(
         self,
@@ -92,12 +113,22 @@ class McpClientManager:
         exc: BaseException,
     ) -> None:
         """Record one MCP connection failure without aborting startup."""
+        transport = getattr(config, "type", "unknown")
+        reason = exc
+        while children := getattr(reason, "exceptions", ()):
+            reason = children[0]
+        detail = (
+            f"HTTP {reason.response.status_code}"
+            if isinstance(reason, httpx.HTTPStatusError)
+            else type(reason).__name__
+        )
+        log.warning("MCP: %r failed to connect (transport=%s): %s", name, transport, detail)
         self._statuses[name] = McpConnectionStatus(
             name=name,
             state="failed",
-            transport=getattr(config, "type", "unknown"),
+            transport=transport,
             auth_configured=auth_configured,
-            detail=str(exc) or exc.__class__.__name__,
+            detail=detail if isinstance(reason, httpx.HTTPStatusError) else str(exc) or detail,
         )
 
     async def close(self) -> None:
@@ -198,21 +229,13 @@ class McpClientManager:
                 write_stream=write_stream,
                 auth_configured=bool(config.env),
             )
-        except asyncio.CancelledError as exc:
-            await self._close_failed_stack(stack)
+        except (asyncio.CancelledError, Exception) as exc:
+            failure = await self._close_failed_stack(stack, exc)
             self._mark_connection_failed(
                 name,
                 config,
                 auth_configured=bool(config.env),
-                exc=exc,
-            )
-        except Exception as exc:
-            await self._close_failed_stack(stack)
-            self._mark_connection_failed(
-                name,
-                config,
-                auth_configured=bool(config.env),
-                exc=exc,
+                exc=failure,
             )
 
     async def _connect_http(self, name: str, config: McpHttpServerConfig) -> None:
@@ -232,21 +255,13 @@ class McpClientManager:
                 write_stream=write_stream,
                 auth_configured=bool(config.headers),
             )
-        except asyncio.CancelledError as exc:
-            await self._close_failed_stack(stack)
+        except (asyncio.CancelledError, Exception) as exc:
+            failure = await self._close_failed_stack(stack, exc)
             self._mark_connection_failed(
                 name,
                 config,
                 auth_configured=bool(config.headers),
-                exc=exc,
-            )
-        except Exception as exc:
-            await self._close_failed_stack(stack)
-            self._mark_connection_failed(
-                name,
-                config,
-                auth_configured=bool(config.headers),
-                exc=exc,
+                exc=failure,
             )
 
     async def _register_connected_session(
