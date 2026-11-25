@@ -405,6 +405,7 @@ def _build_dry_run_preview(
     api_key: str | None,
     api_format: str | None,
     permission_mode: str | None,
+    effort: str | None = None,
 ) -> dict[str, object]:
     from openharness.api.provider import auth_status, detect_provider
     from openharness.commands import create_default_command_registry
@@ -425,12 +426,13 @@ def _build_dry_run_preview(
         api_key=api_key,
         api_format=api_format,
         permission_mode=permission_mode,
+        effort=effort,
     )
     provider = detect_provider(settings)
     auth = auth_status(settings)
     profile_name, profile = settings.resolve_profile()
 
-    plugins = load_plugins(settings, resolved_cwd)
+    plugins = load_plugins(settings, resolved_cwd, include_tools=False)
     plugin_commands = [
         command
         for plugin in plugins
@@ -439,7 +441,7 @@ def _build_dry_run_preview(
     ]
     command_registry = create_default_command_registry(plugin_commands=plugin_commands)
     command_match = command_registry.lookup(prompt) if prompt else None
-    skill_registry = load_skill_registry(resolved_cwd, settings=settings)
+    skill_registry = load_skill_registry(resolved_cwd, settings=settings, include_plugin_tools=False)
     skills = skill_registry.list_skills()
     mcp_servers = load_mcp_server_configs(settings, plugins)
     tool_registry = create_default_tool_registry()
@@ -474,6 +476,7 @@ def _build_dry_run_preview(
         settings,
         cwd=resolved_cwd,
         latest_user_prompt=prompt_seed,
+        include_plugin_tools=False,
     )
 
     command_entries = []
@@ -766,6 +769,7 @@ mcp_app = typer.Typer(name="mcp", help="Manage MCP servers")
 plugin_app = typer.Typer(name="plugin", help="Manage plugins")
 auth_app = typer.Typer(name="auth", help="Manage authentication")
 provider_app = typer.Typer(name="provider", help="Manage provider profiles")
+config_app = typer.Typer(name="config", help="Show or update settings")
 cron_app = typer.Typer(name="cron", help="Manage cron scheduler and jobs")
 autopilot_app = typer.Typer(name="autopilot", help="Manage repo autopilot")
 
@@ -773,6 +777,7 @@ app.add_typer(mcp_app)
 app.add_typer(plugin_app)
 app.add_typer(auth_app)
 app.add_typer(provider_app)
+app.add_typer(config_app)
 app.add_typer(cron_app)
 app.add_typer(autopilot_app)
 
@@ -877,6 +882,40 @@ def plugin_uninstall(
     print(f"Uninstalled plugin: {name}")
 
 
+def _set_plugin_enabled(name: str, enabled: bool) -> None:
+    from openharness.config import load_settings, save_settings
+    from openharness.plugins import load_plugins
+
+    settings = load_settings()
+    plugins = load_plugins(settings, Path.cwd(), include_tools=False)
+    if not any(plugin.name == name for plugin in plugins):
+        typer.echo(
+            f"Plugin '{name}' is not installed. Run 'oh plugin list' to see available plugins.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    settings.enabled_plugins[name] = enabled
+    save_settings(settings)
+    action = "Enabled" if enabled else "Disabled"
+    print(f"{action} plugin '{name}'. Restart session to reload.")
+
+
+@plugin_app.command("enable")
+def plugin_enable(
+    name: str = typer.Argument(..., help="Plugin name to enable"),
+) -> None:
+    """Enable an installed plugin."""
+    _set_plugin_enabled(name, True)
+
+
+@plugin_app.command("disable")
+def plugin_disable(
+    name: str = typer.Argument(..., help="Plugin name to disable"),
+) -> None:
+    """Disable an installed plugin."""
+    _set_plugin_enabled(name, False)
+
+
 # ---- cron subcommands ----
 
 @cron_app.command("start")
@@ -903,11 +942,16 @@ def cron_stop() -> None:
 
 
 @cron_app.command("status")
-def cron_status_cmd() -> None:
+def cron_status_cmd(
+    json_output: bool = typer.Option(False, "--json", help="Output as a JSON object"),
+) -> None:
     """Show cron scheduler status and job summary."""
     from openharness.services.cron_scheduler import scheduler_status
 
     status = scheduler_status()
+    if json_output:
+        print(json.dumps(status, ensure_ascii=False, default=str))
+        return
     state = "running" if status["running"] else "stopped"
     print(f"Scheduler: {state}" + (f" (pid={status['pid']})" if status["pid"] else ""))
     print(f"Jobs:      {status['enabled_jobs']} enabled / {status['total_jobs']} total")
@@ -915,11 +959,16 @@ def cron_status_cmd() -> None:
 
 
 @cron_app.command("list")
-def cron_list_cmd() -> None:
+def cron_list_cmd(
+    json_output: bool = typer.Option(False, "--json", help="Output as a JSON array"),
+) -> None:
     """List all registered cron jobs with schedule and status."""
     from openharness.services.cron import load_cron_jobs
 
     jobs = load_cron_jobs()
+    if json_output:
+        print(json.dumps(jobs, ensure_ascii=False, default=str))
+        return
     if not jobs:
         print("No cron jobs configured.")
         return
@@ -930,8 +979,20 @@ def cron_list_cmd() -> None:
             last = last[:19]  # trim to readable datetime
         last_status = job.get("last_status", "")
         status_indicator = f" [{last_status}]" if last_status else ""
-        print(f"  [{enabled}] {job['name']}  {job.get('schedule', '?')}")
-        print(f"        cmd: {job['command']}")
+        timezone = f" ({job['timezone']})" if job.get("timezone") else ""
+        print(f"  [{enabled}] {job['name']}  {job.get('schedule', '?')}{timezone}")
+        print(f"        cmd: {job.get('command') or '(agent_turn)'}")
+        payload = job.get("payload")
+        if isinstance(payload, dict):
+            print(
+                f"        payload: {payload.get('kind', 'agent_turn')} -> "
+                f"{payload.get('channel', '?')}:{payload.get('to', '?')}"
+            )
+        notify = job.get("notify")
+        if isinstance(notify, dict):
+            notify_type = notify.get("type", "?")
+            target = notify.get("user_open_id") or notify.get("open_id") or notify.get("chat_id") or "?"
+            print(f"        notify: {notify_type} -> {target}")
         print(f"        last: {last}{status_indicator}  next: {job.get('next_run', 'n/a')[:19]}")
 
 
@@ -954,11 +1015,15 @@ def cron_toggle_cmd(
 def cron_history_cmd(
     name: str | None = typer.Argument(None, help="Filter by job name"),
     limit: int = typer.Option(20, "--limit", "-n", help="Number of entries"),
+    json_output: bool = typer.Option(False, "--json", help="Output as a JSON array"),
 ) -> None:
     """Show cron execution history."""
     from openharness.services.cron_scheduler import load_history
 
     entries = load_history(limit=limit, job_name=name)
+    if json_output:
+        print(json.dumps(entries, ensure_ascii=False, default=str))
+        return
     if not entries:
         print("No execution history.")
         return
@@ -995,12 +1060,28 @@ def cron_logs_cmd(
 @autopilot_app.command("status")
 def autopilot_status_cmd(
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+    json_output: bool = typer.Option(False, "--json", help="Output as a JSON object"),
 ) -> None:
     """Show repo autopilot queue status."""
     from openharness.autopilot import RepoAutopilotStore
 
     store = RepoAutopilotStore(cwd)
     counts = store.stats()
+    next_card = store.pick_next_card()
+    if json_output:
+        payload = {
+            "counts": counts,
+            "next": (
+                {"id": next_card.id, "title": next_card.title, "score": next_card.score}
+                if next_card is not None
+                else None
+            ),
+            "registry": str(store.registry_path),
+            "journal": str(store.journal_path),
+            "context": str(store.context_path),
+        }
+        print(json.dumps(payload, ensure_ascii=False, default=str))
+        return
     print("Autopilot queue status:")
     for status_name in (
         "queued",
@@ -1018,7 +1099,6 @@ def autopilot_status_cmd(
         "superseded",
     ):
         print(f"  {status_name}: {counts.get(status_name, 0)}")
-    next_card = store.pick_next_card()
     if next_card is not None:
         print(f"  next: {next_card.id} {next_card.title} (score={next_card.score})")
     print(f"  registry: {store.registry_path}")
@@ -1030,12 +1110,33 @@ def autopilot_status_cmd(
 def autopilot_list_cmd(
     status: str | None = typer.Argument(None, help="Optional status filter"),
     cwd: str = typer.Option(str(Path.cwd()), "--cwd", help="Repository root"),
+    json_output: bool = typer.Option(False, "--json", help="Output as a JSON array"),
 ) -> None:
     """List repo autopilot cards."""
     from openharness.autopilot import RepoAutopilotStore
 
     store = RepoAutopilotStore(cwd)
     cards = store.list_cards(status=status) if status else store.list_cards()
+    if json_output:
+        print(
+            json.dumps(
+                [
+                    {
+                        "id": card.id,
+                        "status": card.status,
+                        "score": card.score,
+                        "title": card.title,
+                        "source_kind": card.source_kind,
+                        "source_ref": card.source_ref,
+                        "body": card.body,
+                    }
+                    for card in cards
+                ],
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return
     if not cards:
         print("No autopilot cards.")
         return
@@ -1953,6 +2054,72 @@ def auth_copilot_logout() -> None:
     print("Copilot authentication cleared.")
 
 
+# ---- config subcommands ----
+
+
+def _config_resolve_target(settings: object, key: str) -> tuple[object, str]:
+    target = settings
+    parts = key.split(".")
+    for part in parts[:-1]:
+        if not hasattr(target, part):
+            raise KeyError(key)
+        target = getattr(target, part)
+    leaf = parts[-1]
+    if not hasattr(target, leaf):
+        raise KeyError(key)
+    return target, leaf
+
+
+def _config_coerce_value(current: object, raw: str) -> object:
+    if isinstance(current, bool):
+        lowered = raw.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"Invalid boolean value: {raw}")
+    if isinstance(current, int) and not isinstance(current, bool):
+        return int(raw)
+    if isinstance(current, float):
+        return float(raw)
+    if isinstance(current, list):
+        return [entry.strip() for entry in raw.split(",") if entry.strip()]
+    return raw
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Print the resolved settings JSON."""
+    from openharness.commands.registry import _settings_json_for_display
+    from openharness.config.settings import load_settings
+
+    print(_settings_json_for_display(load_settings()), flush=True)
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="Setting key, including dotted nested keys"),
+    value: str = typer.Argument(..., help="Value to store"),
+) -> None:
+    """Persist one setting in ~/.openharness/settings.json."""
+    from openharness.config.settings import load_settings, save_settings
+
+    settings = load_settings()
+    try:
+        target, leaf = _config_resolve_target(settings, key)
+    except KeyError:
+        print(f"Unknown config key: {key}", file=sys.stderr)
+        raise typer.Exit(1)
+    try:
+        coerced = _config_coerce_value(getattr(target, leaf), value)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
+    setattr(target, leaf, coerced)
+    save_settings(settings)
+    print(f"Updated {key}", flush=True)
+
+
 # ---- provider subcommands ----
 
 
@@ -2139,7 +2306,7 @@ def main(
     effort: str | None = typer.Option(
         None,
         "--effort",
-        help="Effort level for the session (low, medium, high, max)",
+        help="Effort level for the session (low, medium, high, xhigh/max)",
         rich_help_panel="Model & Effort",
     ),
     verbose: bool = typer.Option(
@@ -2290,16 +2457,16 @@ def main(
     import asyncio
     import logging
 
-    if debug:
+    log_level = os.environ.get("OPENHARNESS_LOG_LEVEL")
+    if debug or log_level:
+        level = logging.DEBUG if debug else getattr(logging, log_level.upper(), logging.WARNING)
+        # HTTP and MCP dependencies can include request URLs in debug and info logs.
         logging.basicConfig(
-            level=logging.DEBUG,
+            level=max(level, logging.WARNING),
             format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
             stream=sys.stderr,
         )
-        logging.getLogger("openharness").setLevel(logging.DEBUG)
-    elif os.environ.get("OPENHARNESS_LOG_LEVEL"):
-        lvl = getattr(logging, os.environ["OPENHARNESS_LOG_LEVEL"].upper(), logging.WARNING)
-        logging.basicConfig(level=lvl, format="%(asctime)s [%(name)s] %(levelname)s %(message)s", stream=sys.stderr)
+        logging.getLogger("openharness").setLevel(level)
 
     if dangerously_skip_permissions:
         permission_mode = "full_auto"
@@ -2334,6 +2501,7 @@ def main(
             api_key=api_key,
             api_format=api_format,
             permission_mode=permission_mode,
+            effort=effort,
         )
         effective_output_format = output_format or "text"
         if effective_output_format == "text":
@@ -2400,6 +2568,7 @@ def main(
                 cwd=cwd,
                 model=session_data.get("model") or model,
                 backend_only=backend_only,
+                debug=debug,
                 base_url=base_url,
                 system_prompt=system_prompt,
                 api_key=api_key,
@@ -2407,6 +2576,7 @@ def main(
                 restore_tool_metadata=session_data.get("tool_metadata"),
                 permission_mode=permission_mode,
                 api_format=api_format,
+                effort=effort,
             )
         )
         return
@@ -2429,6 +2599,7 @@ def main(
                 api_format=api_format,
                 permission_mode=permission_mode,
                 max_turns=max_turns,
+                effort=effort,
             )
         )
         return
@@ -2444,6 +2615,7 @@ def main(
                 api_key=api_key,
                 api_format=api_format,
                 permission_mode=permission_mode,
+                effort=effort,
             )
         )
         return
@@ -2455,10 +2627,12 @@ def main(
             model=model,
             max_turns=max_turns,
             backend_only=backend_only,
+            debug=debug,
             base_url=base_url,
             system_prompt=system_prompt,
             api_key=api_key,
             api_format=api_format,
             permission_mode=permission_mode,
+            effort=effort,
         )
     )
