@@ -1,6 +1,7 @@
-import React, {useDeferredValue, useEffect, useMemo, useState} from 'react';
+import React, {useDeferredValue, useEffect, useMemo, useRef, useState} from 'react';
 import {Box, Text, useApp, useInput} from 'ink';
 
+import {readClipboardImage, type ImageAttachment} from './clipboardImage.js';
 import {CommandPicker} from './components/CommandPicker.js';
 import {ConversationView} from './components/ConversationView.js';
 import {ModalHost} from './components/ModalHost.js';
@@ -11,7 +12,7 @@ import {SwarmPanel} from './components/SwarmPanel.js';
 import {TodoPanel} from './components/TodoPanel.js';
 import {useBackendSession} from './hooks/useBackendSession.js';
 import {ThemeProvider, useTheme} from './theme/ThemeContext.js';
-import type {FrontendConfig} from './types.js';
+import type {FrontendConfig, ImageAttachmentPayload} from './types.js';
 
 const rawReturnSubmit = process.env.OPENHARNESS_FRONTEND_RAW_RETURN === '1';
 const scriptedSteps = (() => {
@@ -64,6 +65,8 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 	const [modalInput, setModalInput] = useState('');
 	const [history, setHistory] = useState<string[]>([]);
 	const [historyIndex, setHistoryIndex] = useState(-1);
+	const [imageAttachments, setImageAttachments] = useState<ImageAttachment[]>([]);
+	const [clipboardStatus, setClipboardStatus] = useState<string | null>(null);
 	const [lastEscapeAt, setLastEscapeAt] = useState(0);
 	const [scriptIndex, setScriptIndex] = useState(0);
 	const [pickerIndex, setPickerIndex] = useState(0);
@@ -77,6 +80,7 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 	const deferredTodoMarkdown = useDeferredValue(session.todoMarkdown);
 	const deferredSwarmTeammates = useDeferredValue(session.swarmTeammates);
 	const deferredSwarmNotifications = useDeferredValue(session.swarmNotifications);
+	const clipboardStatusTimerRef = useRef<NodeJS.Timeout | null>(null);
 
 	useEffect(() => {
 		const nextTheme = session.status.theme;
@@ -84,6 +88,47 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			setThemeName(nextTheme);
 		}
 	}, [session.status.theme, setThemeName]);
+
+	useEffect(() => {
+		return () => {
+			if (clipboardStatusTimerRef.current) {
+				clearTimeout(clipboardStatusTimerRef.current);
+			}
+		};
+	}, []);
+
+	const setTemporaryClipboardStatus = (message: string): void => {
+		setClipboardStatus(message);
+		if (clipboardStatusTimerRef.current) {
+			clearTimeout(clipboardStatusTimerRef.current);
+		}
+		clipboardStatusTimerRef.current = setTimeout(() => {
+			setClipboardStatus(null);
+			clipboardStatusTimerRef.current = null;
+		}, 2500);
+	};
+
+	const attachClipboardImage = (): void => {
+		void (async () => {
+			const image = await readClipboardImage();
+			if (!image) {
+				setTemporaryClipboardStatus('No image found in clipboard');
+				return;
+			}
+			setImageAttachments((items) => [...items, image]);
+			setTemporaryClipboardStatus(`Attached ${image.label}`);
+		})().catch((error: unknown) => {
+			const message = error instanceof Error ? error.message : String(error);
+			setTemporaryClipboardStatus(`Clipboard image unavailable: ${message}`);
+		});
+	};
+
+	const imagePayloads = (): ImageAttachmentPayload[] =>
+		imageAttachments.map((image) => ({
+			media_type: image.media_type,
+			data: image.data,
+			source_path: image.source_path,
+		}));
 
 	// Current tool name for spinner
 	const currentToolName = useMemo(() => {
@@ -191,6 +236,11 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			return;
 		}
 
+		if (!session.busy && key.ctrl && chunk === 'v') {
+			attachClipboardImage();
+			return;
+		}
+
 		// Let ink-text-input handle pasted text directly.
 		if (isPaste) {
 			return;
@@ -270,6 +320,41 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			return;
 		}
 
+		// --- Edit diff modal (also appears while busy) ---
+		if (session.modal?.kind === 'edit_diff') {
+			if (chunk.toLowerCase() === 'y') {
+				session.sendRequest({
+					type: 'permission_response',
+					request_id: session.modal.request_id,
+					allowed: true,
+					permission_reply: 'once',
+				});
+				session.setModal(null);
+				return;
+			}
+			if (chunk.toLowerCase() === 'a') {
+				session.sendRequest({
+					type: 'permission_response',
+					request_id: session.modal.request_id,
+					allowed: true,
+					permission_reply: 'always',
+				});
+				session.setModal(null);
+				return;
+			}
+			if (chunk.toLowerCase() === 'n' || isEscape) {
+				session.sendRequest({
+					type: 'permission_response',
+					request_id: session.modal.request_id,
+					allowed: false,
+					permission_reply: 'reject',
+				});
+				session.setModal(null);
+				return;
+			}
+			return;
+		}
+
 		// --- Question modal (also appears while busy) ---
 		if (session.modal?.kind === 'question') {
 			return; // Let TextInput in ModalHost handle input
@@ -332,8 +417,9 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 
 		if (isEscape) {
 			const now = Date.now();
-			if (input && now - lastEscapeAt < 500) {
+			if ((input || imageAttachments.length > 0) && now - lastEscapeAt < 500) {
 				setInput('');
+				setImageAttachments([]);
 				setHistoryIndex(-1);
 				setLastEscapeAt(0);
 				return;
@@ -373,7 +459,7 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			setModalInput('');
 			return;
 		}
-		if (!value.trim() || session.busy || !session.ready) {
+		if ((!value.trim() && imageAttachments.length === 0) || session.busy || !session.ready) {
 			if (session.busy && value.trim() === '/stop') {
 				session.sendRequest({type: 'interrupt'});
 				session.setBusyLabel('Stopping current operation...');
@@ -382,16 +468,19 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 			return;
 		}
 		// Check if it's an interactive command
-		if (handleCommand(value)) {
+		if (imageAttachments.length === 0 && handleCommand(value)) {
 			setHistory((items) => [...items, value]);
 			setHistoryIndex(-1);
 			setInput('');
 			return;
 		}
-		session.sendRequest({type: 'submit_line', line: value});
-		setHistory((items) => [...items, value]);
+		session.sendRequest({type: 'submit_line', line: value, images: imagePayloads()});
+		if (value.trim()) {
+			setHistory((items) => [...items, value]);
+		}
 		setHistoryIndex(-1);
 		setInput('');
+		setImageAttachments([]);
 		session.setBusy(true);
 	};
 
@@ -476,6 +565,8 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 					toolName={session.busy ? currentToolName : undefined}
 					statusLabel={session.busy ? (session.busyLabel ?? (currentToolName ? `Running ${currentToolName}...` : 'Running agent loop...')) : undefined}
 					suppressSubmit={showPicker}
+					imageAttachmentLabels={imageAttachments.map((image) => image.label)}
+					clipboardStatus={clipboardStatus}
 				/>
 			)}
 
