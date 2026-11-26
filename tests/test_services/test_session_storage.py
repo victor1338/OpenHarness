@@ -10,6 +10,7 @@ from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.services.session_storage import (
     export_session_markdown,
     get_project_session_dir,
+    list_session_snapshots,
     load_session_snapshot,
     save_session_snapshot,
 )
@@ -39,6 +40,41 @@ def test_save_and_load_session_snapshot(tmp_path: Path, monkeypatch):
     assert snapshot["usage"]["output_tokens"] == 2
     assert snapshot["tool_metadata"]["task_focus_state"]["goal"] == "Fix compact carry-over"
     assert snapshot["tool_metadata"]["recent_verified_work"] == ["Focused session storage test passed"]
+
+
+def test_corrupted_session_snapshot_is_ignored(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    from openharness.services.session_storage import load_session_by_id
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    directory = get_project_session_dir(project)
+    (directory / "latest.json").write_text("invalid JSON", encoding="utf-8")
+    (directory / "session-corrupt.json").write_text("[]", encoding="utf-8")
+
+    (directory / "session-invalid-messages.json").write_text(
+        json.dumps({"messages": None}), encoding="utf-8",
+    )
+
+    assert load_session_snapshot(project) is None
+    assert load_session_by_id(project, "corrupt") is None
+    assert load_session_by_id(project, "invalid-messages") is None
+    assert list_session_snapshots(project) == []
+
+
+def test_load_session_by_id_falls_back_after_corrupt_named_file(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    from openharness.services.session_storage import load_session_by_id
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    directory = get_project_session_dir(project)
+    (directory / "session-recover.json").write_text("{bad", encoding="utf-8")
+    (directory / "latest.json").write_text(
+        json.dumps({"session_id": "recover", "messages": []}), encoding="utf-8",
+    )
+
+    assert load_session_by_id(project, "recover")["session_id"] == "recover"
 
 
 def test_export_session_markdown(tmp_path: Path, monkeypatch):
