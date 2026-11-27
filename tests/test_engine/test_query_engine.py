@@ -519,7 +519,16 @@ async def test_query_engine_reactive_compacts_after_prompt_too_long(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_query_engine_tracks_recent_read_files_and_skills(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("read_options", "expected_span", "expected_text"),
+    [
+        ({}, "lines 1-200", "alpha"),
+        ({"offset": "1.0", "limit": "1.0"}, "lines 2-2", "beta"),
+    ],
+)
+async def test_query_engine_tracks_recent_read_files_and_skills(
+    tmp_path: Path, read_options, expected_span: str, expected_text: str
+):
     sample = tmp_path / "hello.txt"
     sample.write_text("alpha\nbeta\n", encoding="utf-8")
     registry = create_default_tool_registry()
@@ -540,7 +549,9 @@ async def test_query_engine_tracks_recent_read_files_and_skills(tmp_path: Path):
                     message=ConversationMessage(
                         role="assistant",
                         content=[
-                            ToolUseBlock(name="read_file", input={"path": str(sample)}),
+                            ToolUseBlock(
+                                name="read_file", input={"path": str(sample), **read_options}
+                            ),
                             ToolUseBlock(name="skill", input={"name": "demo-skill"}),
                         ],
                     ),
@@ -569,7 +580,8 @@ async def test_query_engine_tracks_recent_read_files_and_skills(tmp_path: Path):
     read_state = engine._tool_metadata.get("read_file_state")
     assert isinstance(read_state, list) and read_state
     assert read_state[-1]["path"] == str(sample.resolve())
-    assert "alpha" in read_state[-1]["preview"]
+    assert read_state[-1]["span"] == expected_span
+    assert expected_text in read_state[-1]["preview"]
     task_focus = engine.tool_metadata.get("task_focus_state")
     assert isinstance(task_focus, dict)
     assert "track context" in task_focus.get("goal", "")
@@ -579,7 +591,7 @@ async def test_query_engine_tracks_recent_read_files_and_skills(tmp_path: Path):
     assert invoked_skills[-1] == "demo-skill"
     verified = engine.tool_metadata.get("recent_verified_work")
     assert isinstance(verified, list)
-    assert any("Inspected file" in entry for entry in verified)
+    assert f"Inspected file {sample.resolve()} ({expected_span})" in verified
     assert any("Loaded skill demo-skill" in entry for entry in verified)
 
 
@@ -1182,7 +1194,7 @@ class _OkTool(BaseTool):
 
     async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
         del arguments, context
-        return ToolResult(output="ok")
+        return ToolResult(output="ok", metadata={"sentinel": "metadata"})
 
 
 class _BoomTool(BaseTool):
@@ -1196,6 +1208,182 @@ class _BoomTool(BaseTool):
     async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:
         del arguments, context
         raise RuntimeError("boom")
+
+
+@pytest.mark.asyncio
+async def test_query_engine_synthesizes_tool_result_when_single_tool_raises(tmp_path: Path):
+    registry = ToolRegistry()
+    registry.register(_BoomTool())
+
+    engine = QueryEngine(
+        api_client=FakeApiClient(
+            [
+                _FakeResponse(
+                    message=ConversationMessage(
+                        role="assistant",
+                        content=[
+                            TextBlock(text="Running one tool."),
+                            ToolUseBlock(id="toolu_boom", name="boom_tool", input={}),
+                        ],
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                ),
+                _FakeResponse(
+                    message=ConversationMessage(
+                        role="assistant",
+                        content=[TextBlock(text="Recovered from the failure.")],
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                ),
+            ]
+        ),
+        tool_registry=registry,
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+
+    events = [event async for event in engine.submit_message("run one tool")]
+
+    completed = [event for event in events if isinstance(event, ToolExecutionCompleted)]
+    assert len(completed) == 1
+    assert completed[0].tool_name == "boom_tool"
+    assert completed[0].is_error is True
+    assert "RuntimeError" in completed[0].output
+    assert "boom" in completed[0].output
+
+    user_tool_messages = [
+        msg
+        for msg in engine.messages
+        if msg.role == "user" and any(isinstance(block, ToolResultBlock) for block in msg.content)
+    ]
+    assert len(user_tool_messages) == 1
+    result_blocks = [
+        block for block in user_tool_messages[0].content if isinstance(block, ToolResultBlock)
+    ]
+    assert result_blocks[0].tool_use_id == "toolu_boom"
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert events[-1].message.text == "Recovered from the failure."
+
+
+@pytest.mark.asyncio
+async def test_query_engine_keeps_tool_result_when_interrupted_before_followup(tmp_path: Path):
+    registry = ToolRegistry()
+    registry.register(_OkTool())
+    engine = QueryEngine(
+        api_client=FakeApiClient(
+            [
+                _FakeResponse(
+                    message=ConversationMessage(
+                        role="assistant",
+                        content=[ToolUseBlock(id="toolu_interrupted", name="ok_tool", input={})],
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                ),
+                _FakeResponse(
+                    message=ConversationMessage(
+                        role="assistant",
+                        content=[TextBlock(text="Continued after interruption.")],
+                    ),
+                    usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                ),
+            ]
+        ),
+        tool_registry=registry,
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+
+    stream = engine.submit_message("run one tool")
+    async for event in stream:
+        if isinstance(event, ToolExecutionCompleted):
+            break
+    await stream.aclose()
+
+    assert engine.has_pending_continuation()
+    result_blocks = [
+        block
+        for message in engine.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert len(result_blocks) == 1
+    assert result_blocks[0].tool_use_id == "toolu_interrupted"
+    assert result_blocks[0].content == "ok"
+
+    continued_events = [event async for event in engine.continue_pending()]
+    assert isinstance(continued_events[-1], AssistantTurnComplete)
+    assert continued_events[-1].message.text == "Continued after interruption."
+
+
+@pytest.mark.asyncio
+async def test_query_engine_keeps_finished_parallel_results_on_cancellation(tmp_path, monkeypatch):
+    slow_started = asyncio.Event()
+    slow_stopped = asyncio.Event()
+    fast_finished = asyncio.Event()
+
+    async def execute_tool(context, name, call_id, arguments):
+        if name == "fast":
+            await slow_started.wait()
+            fast_finished.set()
+            return ToolResultBlock(tool_use_id=call_id, content="already finished")
+        slow_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            slow_stopped.set()
+
+    monkeypatch.setattr("openharness.engine.query._execute_tool_call", execute_tool)
+    engine = QueryEngine(
+        api_client=FakeApiClient([
+            _FakeResponse(
+                message=ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(id="toolu_fast", name="fast", input={}),
+                        ToolUseBlock(id="toolu_slow", name="slow", input={}),
+                    ],
+                ),
+                usage=UsageSnapshot(),
+            ),
+            _FakeResponse(
+                message=ConversationMessage(role="assistant", content=[TextBlock(text="resumed")]),
+                usage=UsageSnapshot(),
+            ),
+        ]),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings()),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+
+    async def run_turn():
+        return [event async for event in engine.submit_message("run two tools")]
+
+    turn = asyncio.create_task(run_turn())
+    try:
+        await asyncio.wait_for(fast_finished.wait(), timeout=5)
+    finally:
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+    assert slow_stopped.is_set()
+    assert engine.has_pending_continuation()
+    fast, slow = engine.messages[-1].content
+    assert isinstance(fast, ToolResultBlock) and fast.tool_use_id == "toolu_fast"
+    assert fast.content == "already finished" and not fast.is_error
+    assert isinstance(slow, ToolResultBlock) and slow.tool_use_id == "toolu_slow"
+    assert slow.is_error and "interrupted" in slow.content
+
+    resumed = [event async for event in engine.continue_pending()]
+    assert isinstance(resumed[-1], AssistantTurnComplete)
+    assert resumed[-1].message.text == "resumed"
 
 
 class _LargeOutputTool(BaseTool):
@@ -1340,6 +1528,7 @@ async def test_query_engine_synthesizes_tool_result_when_parallel_tool_raises(tm
     assert set(completed_by_name) == {"ok_tool", "boom_tool"}
     assert completed_by_name["ok_tool"].is_error is False
     assert completed_by_name["ok_tool"].output == "ok"
+    assert completed_by_name["ok_tool"].metadata == {"sentinel": "metadata"}
     assert completed_by_name["boom_tool"].is_error is True
     assert "RuntimeError" in completed_by_name["boom_tool"].output
     assert "boom" in completed_by_name["boom_tool"].output
@@ -1353,6 +1542,64 @@ async def test_query_engine_synthesizes_tool_result_when_parallel_tool_raises(tm
 
     assert isinstance(events[-1], AssistantTurnComplete)
     assert events[-1].message.text == "Recovered from the failure."
+
+
+@pytest.mark.asyncio
+async def test_query_engine_sanitizes_dangling_tool_use_before_new_prompt(tmp_path: Path):
+    engine = QueryEngine(
+        api_client=StaticApiClient("fresh reply"),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+    engine.load_messages([
+        ConversationMessage.from_user_text("previous request"),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="call_missing_output", name="ok_tool", input={})],
+        ),
+    ])
+
+    events = [event async for event in engine.submit_message("new prompt")]
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert events[-1].message.text == "fresh reply"
+    assert not any(
+        isinstance(block, ToolUseBlock) and block.id == "call_missing_output"
+        for message in engine.messages
+        for block in message.content
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_engine_continue_pending_sanitizes_dangling_tool_use(tmp_path: Path):
+    engine = QueryEngine(
+        api_client=StaticApiClient("continued reply"),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="claude-test",
+        system_prompt="system",
+    )
+    engine.load_messages([
+        ConversationMessage.from_user_text("previous request"),
+        ConversationMessage(
+            role="assistant",
+            content=[ToolUseBlock(id="call_missing_output", name="ok_tool", input={})],
+        ),
+    ])
+
+    events = [event async for event in engine.continue_pending()]
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert events[-1].message.text == "continued reply"
+    assert not any(
+        isinstance(block, ToolUseBlock) and block.id == "call_missing_output"
+        for message in engine.messages
+        for block in message.content
+    )
 
 
 @pytest.mark.asyncio
@@ -1397,7 +1644,7 @@ async def test_query_engine_offloads_large_tool_result_outputs(tmp_path: Path, m
 
     completed = [event for event in events if isinstance(event, ToolExecutionCompleted)]
     assert len(completed) == 1
-    assert completed[0].output.startswith("[Tool output truncated]")
+    assert completed[0].output.startswith("[Tool output truncated — the preview below is incomplete]")
     assert "snapshot-line" in completed[0].output
 
     user_tool_messages = [
