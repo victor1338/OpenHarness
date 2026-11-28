@@ -83,20 +83,26 @@ def build_backend_command(
     cwd: str | None = None,
     model: str | None = None,
     max_turns: int | None = None,
+    effort: str | None = None,
     base_url: str | None = None,
     system_prompt: str | None = None,
     api_key: str | None = None,
     api_format: str | None = None,
     permission_mode: str | None = None,
+    debug: bool = False,
 ) -> list[str]:
     """Return the command used by the React frontend to spawn the backend host."""
     command = [sys.executable, "-m", "openharness", "--backend-only"]
+    if debug:
+        command.append("--debug")
     if cwd:
         command.extend(["--cwd", cwd])
     if model:
         command.extend(["--model", model])
     if max_turns is not None:
         command.extend(["--max-turns", str(max_turns)])
+    if effort:
+        command.extend(["--effort", effort])
     if base_url:
         command.extend(["--base-url", base_url])
     if system_prompt:
@@ -116,11 +122,13 @@ async def launch_react_tui(
     cwd: str | None = None,
     model: str | None = None,
     max_turns: int | None = None,
+    effort: str | None = None,
     base_url: str | None = None,
     system_prompt: str | None = None,
     api_key: str | None = None,
     api_format: str | None = None,
     permission_mode: str | None = None,
+    debug: bool = False,
 ) -> int:
     """Launch the React terminal frontend as the default UI."""
     frontend_dir = get_frontend_dir()
@@ -148,11 +156,13 @@ async def launch_react_tui(
                 cwd=cwd or str(Path.cwd()),
                 model=model,
                 max_turns=max_turns,
+                effort=effort,
                 base_url=base_url,
                 system_prompt=system_prompt,
                 api_key=api_key,
                 api_format=api_format,
                 permission_mode=permission_mode,
+                debug=debug,
             ),
             "initial_prompt": prompt,
             "theme": _resolve_theme(),
